@@ -48,6 +48,17 @@ def _should_use_sm121_single_pass_decode(
         return False
     if indexed_width and int(indexed_page_size or 0) != 64:
         return False
+    # The single-pass route lands in run_unified_prefill, whose MG kernels
+    # support fixed index widths only (DSV4 single-cache 128/512/1024/2048;
+    # dual-cache swa==128). Selecting an unsupported width here turned an
+    # optimization into a hard failure (observed: swa_width=256 single-cache
+    # from a DSpark draft layer). Fall through to the unified decode kernel,
+    # which handles arbitrary widths.
+    if indexed_width:
+        if int(swa_width) != 128:
+            return False
+    elif int(swa_width) not in (128, 512, 1024, 2048):
+        return False
     chunks = (int(swa_width) + 63) // 64 + (int(indexed_width) + 63) // 64
     return chunks <= 10
 
