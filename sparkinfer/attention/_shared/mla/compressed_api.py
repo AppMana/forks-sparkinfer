@@ -16,6 +16,7 @@ from .compressed_config import (
     compressed_mla_split_chunks_for_contract,
 )
 from .compressed_reference import (
+    COMPRESSED_MLA_BYTES_PER_TOKEN,
     COMPRESSED_MLA_DSV4_PAGE_SIZE,
     COMPRESSED_MLA_HEAD_DIM,
     compressed_mla_page_nbytes,
@@ -524,10 +525,17 @@ def _validate_compressed_cache_layout(
     if page_size <= 0:
         raise ValueError(f"{name} page_size must be positive, got {page_size}")
     expected_page_nbytes = compressed_mla_page_nbytes(page_size)
-    if int(cache.shape[1]) != expected_page_nbytes:
+    # The kernel touches page_size*584 bytes per page; the 576-multiple
+    # round-up is the SGLang pool convention. Accept both the padded SGLang
+    # width and the unpadded vLLM width (paged fp8_ds_mla blocks flattened to
+    # [num_blocks, block_size*584]); anything wider also works because the
+    # page stride is resolved from the tensor at launch.
+    min_page_nbytes = page_size * COMPRESSED_MLA_BYTES_PER_TOKEN
+    if int(cache.shape[1]) < min_page_nbytes:
         raise ValueError(
-            f"{name} page byte width must be {expected_page_nbytes} for page_size "
-            f"{page_size}, got {int(cache.shape[1])}"
+            f"{name} page byte width must be at least {min_page_nbytes} "
+            f"(page_size {page_size} * 584; SGLang-padded width "
+            f"{expected_page_nbytes} also accepted), got {int(cache.shape[1])}"
         )
 
 

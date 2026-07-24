@@ -2313,6 +2313,7 @@ def _cache_block_stride_bytes(
     record_bytes: int | None = None,
 ) -> int:
     from sparkinfer.attention._shared.mla.compressed_reference import (
+        COMPRESSED_MLA_BYTES_PER_TOKEN,
         compressed_mla_page_nbytes,
     )
 
@@ -2321,20 +2322,33 @@ def _cache_block_stride_bytes(
         # 432B (NVFP4_E4M3). ``record_bytes`` comes from traits.kv_gmem_stride.
         rec = int(record_bytes) if record_bytes is not None else _GLM_KV_GMEM_STRIDE
         expected = int(page_size) * rec
+        min_extent = expected
     else:
         expected = int(compressed_mla_page_nbytes(int(page_size)))
+        # The DSV4 kernel touches page_size*584 bytes per page (576B payload
+        # entries + the 8B UE8M0 scale footers; the TMA bulk transfers exclude
+        # the footer region, see io.py). The 576-multiple round-up in
+        # compressed_mla_page_nbytes is the SGLang memory-pool convention, not
+        # a kernel addressing requirement, so unpadded vLLM pages
+        # (page_size * 584 bytes, e.g. paged fp8_ds_mla blocks) are accepted.
+        min_extent = int(page_size) * COMPRESSED_MLA_BYTES_PER_TOKEN
     # Contiguous inputs are flattened before launch, so their original rank is
-    # not a physical-layout contract and the standard page stride applies.
+    # not a physical-layout contract and the page stride is the row width.
     # Packed vLLM page views are non-contiguous and carry the physical
     # per-block stride in dimension 0.
     if not cache.is_contiguous() and cache.ndim >= 2:
         stride = int(cache.stride(0)) * int(cache.element_size())
-        if stride < expected:
+        if stride < min_extent:
             raise ValueError(
                 f"SM120 sparse MLA cache block stride {stride} is smaller than "
-                f"page payload {expected}"
+                f"page payload {min_extent}"
             )
         return stride
+    if cache.ndim >= 2:
+        row = int(cache.shape[-1]) * int(cache.element_size())
+        if cache.ndim == 2 and min_extent <= row < expected:
+            # Unpadded contiguous pages: the row width IS the page stride.
+            return row
     return expected
 
 
