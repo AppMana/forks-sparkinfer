@@ -12,7 +12,7 @@ from typing import Callable, Optional, Sequence
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
-from torch.utils.cpp_extension import load
+from ._ext import load_ext
 
 from ._cuda_ipc import CudaRTLibrary
 from .pcie_oneshot import (
@@ -110,9 +110,9 @@ def _staging_layout(
 def _load_extension():
     source = Path(__file__).with_name("pcie_dcp_a2a.cu")
     verbose = os.getenv("SPARKINFER_PCIE_DCP_A2A_VERBOSE_BUILD", "0") == "1"
-    return load(
-        name="sparkinfer_pcie_dcp_a2a_ext",
-        sources=[str(source)],
+    return load_ext(
+        "sparkinfer_pcie_dcp_a2a_ext",
+        source,
         extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
         extra_ldflags=["-lcuda"],
         verbose=verbose,
