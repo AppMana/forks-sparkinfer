@@ -1338,6 +1338,26 @@ def _compile_progress_details(
     return " ".join(parts)
 
 
+def _note_jit_compile(
+    func: Any,
+    compile_spec: KernelCompileSpec | None,
+    cache_key: str,
+) -> None:
+    """Announce that a launch is about to compile instead of loading an object.
+
+    Every path into ``cute.compile`` below goes through here first.  Under
+    ``SPARKINFER_REQUIRE_AOT`` this raises; otherwise it warns once per kernel.
+    A miss that says nothing is the failure this whole mechanism exists to end.
+    """
+    from .aot import note_jit_compile
+
+    kernel_id = compile_spec.kernel_id if compile_spec is not None else ""
+    detail = f"target={_compile_target_name(func)}"
+    if compile_spec is not None:
+        detail += f" version={compile_spec.version} spec={compile_spec.json_key}"
+    note_jit_compile(kernel_id=kernel_id, cache_key=cache_key, detail=detail)
+
+
 def _call_cute_compile(
     compile_callable: Any,
     func: Any,
@@ -1402,11 +1422,18 @@ def _call_cute_compile(
 
 
 def _iter_fingerprint_files(root: Path) -> list[Path]:
+    from .aot import AOT_CACHE_DIRNAME
+
     files = []
     for path in root.rglob("*"):
         if not path.is_file():
             continue
         if "__pycache__" in path.parts:
+            continue
+        # The shipped AOT cache lives under this root and is keyed *by* this
+        # fingerprint.  Including it would mean every object invalidated the
+        # fingerprint that selects it, so nothing shipped could ever be found.
+        if AOT_CACHE_DIRNAME in path.parts:
             continue
         if path.suffix in {".pyc", ".pyo"}:
             continue
@@ -1506,7 +1533,6 @@ def _compile_environment_key() -> tuple[tuple[str, str], ...]:
         "CUDA_PATH",
         "CUDA_TOOLKIT_PATH",
         "CUDACXX",
-        "CUTE_DSL_ARCH",
         "NVCC_APPEND_FLAGS",
         "NVCC_PREPEND_FLAGS",
     }
@@ -1524,13 +1550,22 @@ def _compile_environment_key() -> tuple[tuple[str, str], ...]:
         "SPARKINFER_PRINT_COMPILE_PROGRESS",
         "SPARKINFER_TIMING",
         "SPARKINFER_TIMING_THRESHOLD_MS",
-        "CUTE_DSL_CACHE_DIR",
+        # Resolved below into a synthetic entry instead of being taken raw:
+        # the AOT builder has no GPU and must set it, the serving node has a
+        # GPU and must not have to.  Both have to produce the same key.
+        "CUTE_DSL_ARCH",
+        "SPARKINFER_AOT_CACHE_DIR",
+        "SPARKINFER_REQUIRE_AOT",
     }
     for name in os.environ:
         if name.startswith(("SPARKINFER_", "CUTE_", "CUTLASS_")):
             if name not in operational_env_vars:
                 compile_env_vars.add(name)
-    return tuple((name, os.environ.get(name, "")) for name in sorted(compile_env_vars))
+    from .aot import resolved_gpu_arch
+
+    entries = [(name, os.environ.get(name, "")) for name in sorted(compile_env_vars)]
+    entries.append(("__resolved_gpu_arch", resolved_gpu_arch()))
+    return tuple(entries)
 
 
 @lru_cache(maxsize=16)
@@ -2370,8 +2405,12 @@ def _ensure_cute_compile_manifest(
     manifest_path = _cache_manifest_path(cache_key)
     if manifest_path.exists():
         return
-    object_bytes = _cache_object_path(cache_key).read_bytes()
-    _write_compile_manifest(cache_key, cache_payload, func, object_bytes)
+    object_path = _cache_object_path(cache_key)
+    if not object_path.exists():
+        # The hit came from a read-only AOT directory, which ships its own
+        # manifest.  Nothing to backfill in the writable cache.
+        return
+    _write_compile_manifest(cache_key, cache_payload, func, object_path.read_bytes())
 
 
 @contextmanager
@@ -2392,12 +2431,39 @@ def _disk_cache_key_lock(cache_key: str):
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
+def _iter_cache_object_paths(cache_key: str):
+    """Every place a prebuilt object for ``cache_key`` may live.
+
+    Read-only AOT directories (the one inside the wheel, plus any staged via
+    ``SPARKINFER_AOT_CACHE_DIR``) are searched before the writable per-user
+    cache, so a shipped object always wins over whatever a previous run
+    happened to JIT into ``~/.cache``.
+    """
+    from .aot import readonly_cache_dirs
+
+    relative = Path(cache_key[:2]) / f"{cache_key}.o"
+    for directory in readonly_cache_dirs():
+        yield directory / relative, True
+    yield _cache_object_path(cache_key), False
+
+
 def _load_cute_compile_from_disk(cache_key: str):
+    from .aot import record_aot_hit
+
+    for object_path, packaged in _iter_cache_object_paths(cache_key):
+        if not object_path.exists():
+            continue
+        compiled = _load_cute_compile_object(object_path, cache_key)
+        if compiled is not None:
+            if packaged:
+                record_aot_hit()
+            return compiled
+    return None
+
+
+def _load_cute_compile_object(object_path: Path, cache_key: str):
     from cutlass.base_dsl.export.external_binary_module import ExternalBinaryModule
 
-    object_path = _cache_object_path(cache_key)
-    if not object_path.exists():
-        return None
     try:
         # CUTLASS may finalize or patch the ELF while loading it.  The cache
         # object is content-addressed and its digest is recorded in the compile
@@ -2502,6 +2568,9 @@ def compile_cache_info() -> dict[str, int | bool]:
         info["spec_memo_size"] = len(_SPEC_MEMO)
         info["spec_memo_hits"] = _SPEC_MEMO_HITS
         info["spec_memo_misses"] = _SPEC_MEMO_MISSES
+    from .aot import aot_info
+
+    info.update(aot_info())  # type: ignore[arg-type]
     return info
 
 
@@ -2620,6 +2689,7 @@ def compile(
                 target=func,
                 cache_key=compile_spec if compile_spec is not None else payload,
             )
+            _note_jit_compile(func, compile_spec, cache_key)
             call_kwargs = {
                 k: v for k, v in kwargs.items() if k != "__dsl_compile_options_key"
             }
@@ -2666,6 +2736,7 @@ def compile(
         target=func,
         cache_key=compile_spec if compile_spec is not None else payload,
     )
+    _note_jit_compile(func, compile_spec, cache_key)
     call_kwargs = {k: v for k, v in kwargs.items() if k != "__dsl_compile_options_key"}
     compiled = _call_cute_compile(
         compile_callable,

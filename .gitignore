@@ -23,3 +23,8 @@ probe.*.json
 
 .sm120port/
 .sm120port_prefill/
+
+# Build outputs staged into the package tree by scripts/build_aot_cache.py and
+# setup.py.  They belong in the wheel, never in the repo.
+sparkinfer/_aot_cache/
+sparkinfer/_build_info.json

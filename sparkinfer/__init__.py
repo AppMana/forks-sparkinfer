@@ -72,6 +72,14 @@ _GROUPS = ("attention", "comm", "gemm", "moe", "norm", "quantization")
 _LAZY_ROOT_ATTRS: dict[str, tuple[str, str]] = {
     # public name -> (module, attribute)
     "ScratchBufferSpec": ("._lib.scratch", "ScratchBufferSpec"),
+    # AOT surface: aot_info() reports whether the installed wheel carries
+    # prebuilt CuTe-DSL kernels and how many launches have fallen back to JIT;
+    # check_build_compatibility() raises when the wheel's torch/CUDA binding
+    # does not match the running environment.
+    "AotCacheMiss": ("._lib.aot", "AotCacheMiss"),
+    "AotCacheMissWarning": ("._lib.aot", "AotCacheMissWarning"),
+    "aot_info": ("._lib.aot", "aot_info"),
+    "check_build_compatibility": ("._lib.build_info", "check_runtime_compatibility"),
 }
 
 
@@ -128,9 +136,13 @@ def __dir__() -> list[str]:
 
 
 __all__ = [
+    "AotCacheMiss",
+    "AotCacheMissWarning",
     "KernelResolutionFrozenError",
     "OpMeta",
     "ScratchBufferSpec",
+    "aot_info",
+    "check_build_compatibility",
     "clear_all_caches",
     "compilation_frozen",
     "find_op",
