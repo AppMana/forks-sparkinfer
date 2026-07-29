@@ -175,10 +175,17 @@ the SparkInfer NVFP4 path.
 Hilton's working `appmana/deepseek-v4-int4-int8` lane is a useful control but
 its proven core selects native FlashMLA over an `int8_ds_mla` cache and Marlin
 INT4 experts. That correctness does not validate this library's NVFP4
-integration or `norm.mhc`. A narrow shared-mHC integration is being evaluated
-for GB12x, but it is not active or live-proven and must not be generalized into
-a checkpoint-wide “SparkInfer INT4 lane.” The full topology, kernel ownership,
-public comparison numbers, and missing-evidence register live in the
+integration or `norm.mhc`.
+
+Downstream vLLM commit `75b9aff02c` adds a narrow GB12x adapter for
+`norm.mhc`: first-layer 2D broadcast plus fused norm, inter-layer fused
+post/pre plus norm, and final post. HCHead and standalone 3D pre remain on
+vLLM's Triton path because SparkInfer has no matching API. Its offline suite
+passed 126 tests with two hardware skips, but no image containing the adapter
+has been built or live-tested on SM121. It must not be generalized into a
+checkpoint-wide “SparkInfer INT4 lane”; FlashMLA, Marlin, and the native INT8
+indexer remain in place. The full topology, kernel ownership, public comparison
+numbers, and missing-evidence register live in the
 [Hilton performance reference](https://github.com/hannesholste/dragonintel/blob/main/docs/dsv4-spark-performance-references.md).
 
 ## Where to look next
