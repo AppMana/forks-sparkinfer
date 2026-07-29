@@ -1,0 +1,337 @@
+name: Build wheels (PCIe comm extensions, AOT)
+
+# Publishes two manylinux_2_28 wheels for sparkinfer -- x86_64 and aarch64 --
+# each carrying the four AOT-compiled PCIe comm extensions, plus a PEP 503
+# simple index on gh-pages.
+#
+# Why a wheel exists at all: setup.py builds sparkinfer_pcie_{dma,oneshot,
+# twoshot,dcp_a2a}_ext only if it can import torch.utils.cpp_extension, and
+# returns {} -- a silent pure-Python install -- when it cannot. Since torch is
+# NOT in build-system.requires, the default PEP 517 isolated build always takes
+# that path, and sparkinfer/comm/pcie/_ext.py then JIT-compiles with nvcc
+# inside the first collective of a live request. Every build below therefore
+# installs torch first and never builds under isolation, and every build
+# asserts the four .so are actually inside the wheel. That assertion is the
+# point of this workflow; without it a green run means nothing.
+#
+# CUDA 13.0, single variant, no cu128 job. sm_121 (GB10 / DGX Spark) does not
+# exist as an nvcc target before CUDA 12.9 -- `nvcc -arch=sm_121` is rejected
+# outright by 12.8 -- and CUDA 13.0 still emits sm_86, so one toolkit covers
+# both deployed architectures and a second variant would buy nothing.
+#
+# Consequence to keep in mind: these wheels are cp312-only and are bound to the
+# torch C++ ABI and CUDA major below, but the filename records neither. Do not
+# publish a wheel built against a different torch/CUDA under the same version.
+
+on:
+  push:
+    branches: [appmana/main, build-wheels]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Matches the serving image: requirements/cuda.txt pins torch==2.13.0 and the
+  # Sparks run 2.13.0+cu130 (driver 580.173.02, CUDA 13.0).
+  TORCH_VERSION: "2.13.0"
+  CUDA_INDEX: "cu130"
+  PYTHON_TAG: "cp312"
+
+jobs:
+  release-meta:
+    name: Compute release metadata
+    runs-on: ubuntu-24.04
+    outputs:
+      tag_name: ${{ steps.meta.outputs.tag_name }}
+      release_name: ${{ steps.meta.outputs.release_name }}
+    steps:
+      - name: Compute tag and release name
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+          else
+            tag="v1.0.1"
+          fi
+          echo "tag_name=${tag}" >> "$GITHUB_OUTPUT"
+          echo "release_name=sparkinfer ${tag}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------- x86_64
+  manylinux-wheel:
+    name: Wheel (manylinux_2_28, x86_64)
+    runs-on: ubuntu-24.04
+    needs: release-meta
+    env:
+      # The device code in the four .cu files is architecturally plain -- no
+      # tcgen05, wgmma, cp.async.bulk, mbarrier or cluster instructions, and
+      # the only arch guard is a __CUDA_ARCH__ >= 800 gate on bf16
+      # (pcie_oneshot.cu:127). So the arch list is a coverage choice, not a
+      # correctness constraint: one fat binary serves the fleet. 8.6 is the
+      # Ampere consumer target; 12.0a/12.1a are the archs the library itself
+      # declares in sparkinfer/_lib/meta.py:44. There is no PTX entry because
+      # nothing here needs forward compatibility to an unlisted arch.
+      SPARKINFER_ARCH_LIST: "8.6 12.0a 12.1a"
+    steps:
+      - name: Free runner disk (the cuda13 manylinux builder is ~20GB)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+
+      - uses: actions/checkout@v4
+
+      - name: Build + repair manylinux_2_28 wheel in the pytorch cuda13 builder
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD":/io -w /io \
+            -e TORCH_CUDA_ARCH_LIST="${SPARKINFER_ARCH_LIST}" \
+            pytorch/manylinux2_28-builder:cuda13.0 bash -c '
+            set -euo pipefail
+            export PATH=/opt/python/'"${PYTHON_TAG}"'-'"${PYTHON_TAG}"'/bin:$PATH
+            # CUDAExtension links -lcuda (setup.py:47). Only the driver stub
+            # exists in a builder container, and it is not on the default link
+            # path.
+            export LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LIBRARY_PATH:-}"
+            python -m pip install -q -U pip uv
+            uv pip install --system -q "setuptools>=77" "packaging>=24" wheel ninja
+            uv pip install --system -q --index-url https://download.pytorch.org/whl/'"${CUDA_INDEX}"' torch=='"${TORCH_VERSION}"'
+            rm -rf build dist dist_manylinux
+            # No isolation: torch must be importable or setup.py silently
+            # ships nothing.
+            MAX_JOBS=2 NVCC_THREADS=2 python setup.py bdist_wheel
+            uv pip install --system -q auditwheel
+            auditwheel repair dist/*.whl --plat manylinux_2_28_x86_64 \
+              --exclude "libtorch*.so*" --exclude "libc10*.so*" --exclude "libcudart*.so*" \
+              --exclude "libcuda.so*" --exclude "libcudnn*.so*" --exclude "libcublas*.so*" \
+              --exclude "libnvToolsExt*.so*" \
+              -w /io/dist_manylinux/
+          '
+          sudo chown -R "$(id -u):$(id -g)" dist_manylinux 2>/dev/null || true
+          ls -la dist_manylinux/*.whl
+
+      - name: Assert the four AOT extensions are in the wheel
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob, sys, zipfile
+          wheels = glob.glob("dist_manylinux/*.whl")
+          assert len(wheels) == 1, f"expected exactly one wheel, got {wheels}"
+          names = zipfile.ZipFile(wheels[0]).namelist()
+          want = ["dma", "oneshot", "twoshot", "dcp_a2a"]
+          missing = [
+              w for w in want
+              if not any(n.startswith(f"sparkinfer_pcie_{w}_ext") and n.endswith(".so")
+                         for n in names)
+          ]
+          if missing:
+              sys.exit(
+                  f"{wheels[0]} is a pure-Python fallback build: no "
+                  f"sparkinfer_pcie_{{{','.join(missing)}}}_ext*.so. torch was not "
+                  f"importable at build time, or build isolation was in effect."
+              )
+          if "cp312" not in wheels[0] or "manylinux_2_28_x86_64" not in wheels[0]:
+              sys.exit(f"unexpected wheel tag: {wheels[0]}")
+          print(f"ok: {wheels[0]}")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sparkinfer-manylinux_2_28-${{ env.CUDA_INDEX }}
+          path: dist_manylinux/*.whl
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- aarch64
+  # For the DGX Spark (GB10): its Grace CPU is aarch64, so an x86_64 wheel
+  # cannot be installed there at all, whatever SASS it carries.
+  #
+  # The builder image is `manylinuxaarch64-builder` -- the naming differs from
+  # the x86_64 job's `manylinux2_28-builder`, and that image is an amd64-only
+  # manifest, so it cannot be reused here.
+  manylinux-wheel-aarch64:
+    name: Wheel (manylinux_2_28, aarch64)
+    runs-on: ubuntu-24.04-arm
+    needs: release-meta
+    env:
+      # sparkinfer's device gate accepts compute capability 12.0 and 12.1 only
+      # (sparkinfer/_lib/gating.py:29-32), and no aarch64 NVIDIA part ships
+      # sm_86 or sm_120. That leaves exactly GB10.
+      SPARKINFER_ARCH_LIST: "12.1a"
+    steps:
+      - name: Free runner disk (the cuda13 manylinux builder is ~20GB)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+
+      - uses: actions/checkout@v4
+
+      - name: Build + repair manylinux_2_28 aarch64 wheel in the pytorch cuda13 builder
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD":/io -w /io \
+            -e TORCH_CUDA_ARCH_LIST="${SPARKINFER_ARCH_LIST}" \
+            pytorch/manylinuxaarch64-builder:cuda13.0 bash -c '
+            set -euo pipefail
+            export PATH=/opt/python/'"${PYTHON_TAG}"'-'"${PYTHON_TAG}"'/bin:$PATH
+            export LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LIBRARY_PATH:-}"
+            python -m pip install -q -U pip uv
+            uv pip install --system -q "setuptools>=77" "packaging>=24" wheel ninja
+            uv pip install --system -q --index-url https://download.pytorch.org/whl/'"${CUDA_INDEX}"' torch=='"${TORCH_VERSION}"'
+            rm -rf build dist dist_manylinux
+            # The hosted arm64 runner is 4 cores / 16 GB. Serialize nvcc;
+            # wall-clock matters less than finishing.
+            MAX_JOBS=1 NVCC_THREADS=1 python setup.py bdist_wheel
+            uv pip install --system -q auditwheel
+            auditwheel repair dist/*.whl --plat manylinux_2_28_aarch64 \
+              --exclude "libtorch*.so*" --exclude "libc10*.so*" --exclude "libcudart*.so*" \
+              --exclude "libcuda.so*" --exclude "libcudnn*.so*" --exclude "libcublas*.so*" \
+              --exclude "libnvToolsExt*.so*" \
+              -w /io/dist_manylinux/
+          '
+          sudo chown -R "$(id -u):$(id -g)" dist_manylinux 2>/dev/null || true
+          ls -la dist_manylinux/*.whl
+
+      - name: Assert the four AOT extensions are in the wheel
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob, sys, zipfile
+          wheels = glob.glob("dist_manylinux/*.whl")
+          assert len(wheels) == 1, f"expected exactly one wheel, got {wheels}"
+          names = zipfile.ZipFile(wheels[0]).namelist()
+          want = ["dma", "oneshot", "twoshot", "dcp_a2a"]
+          missing = [
+              w for w in want
+              if not any(n.startswith(f"sparkinfer_pcie_{w}_ext") and n.endswith(".so")
+                         for n in names)
+          ]
+          if missing:
+              sys.exit(
+                  f"{wheels[0]} is a pure-Python fallback build: no "
+                  f"sparkinfer_pcie_{{{','.join(missing)}}}_ext*.so. torch was not "
+                  f"importable at build time, or build isolation was in effect."
+              )
+          if "cp312" not in wheels[0] or "manylinux_2_28_aarch64" not in wheels[0]:
+              sys.exit(f"unexpected wheel tag: {wheels[0]}")
+          print(f"ok: {wheels[0]}")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sparkinfer-manylinux_2_28_aarch64-${{ env.CUDA_INDEX }}
+          path: dist_manylinux/*.whl
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- publish
+  publish-release:
+    name: Publish release
+    runs-on: ubuntu-24.04
+    needs: [release-meta, manylinux-wheel, manylinux-wheel-aarch64]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+      - name: List wheels
+        run: ls -la release-artifacts/
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release-meta.outputs.tag_name }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.release-meta.outputs.release_name }}
+          draft: false
+          prerelease: false
+          files: release-artifacts/*.whl
+          fail_on_unmatched_files: true
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------- gh-pages simple index
+  # Same mechanism as forks-flash-mla-ampere-dsv4: wheels live as GitHub
+  # Release assets, and gh-pages carries only a PEP 503 index pointing at them,
+  # with links.tsv as the durable manifest so earlier releases survive.
+  publish-simple-index:
+    name: Publish gh-pages PEP 503 simple index
+    runs-on: ubuntu-24.04
+    needs: [release-meta, manylinux-wheel, manylinux-wheel-aarch64, publish-release]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Prepare gh-pages branch
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git ls-remote --exit-code --heads "$REPO_URL" gh-pages >/dev/null 2>&1; then
+            git clone --depth 1 --branch gh-pages "$REPO_URL" gh-pages
+          else
+            mkdir -p gh-pages && pushd gh-pages >/dev/null
+            git init -q && git checkout -q -b gh-pages && git remote add origin "$REPO_URL"
+            popd >/dev/null
+          fi
+
+      - name: Regenerate simple index (append this release's wheels)
+        shell: bash
+        env:
+          TAG_NAME: ${{ needs.release-meta.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          pkg_dir="gh-pages/sparkinfer"          # already PEP 503 normalized
+          mkdir -p "$pkg_dir"
+          manifest="${pkg_dir}/links.tsv"; touch "$manifest"
+          base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}"
+          urlquote () { python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$1"; }
+
+          shopt -s nullglob
+          n=0
+          for whl in release-artifacts/*.whl; do
+            base="$(basename "$whl")"; hash="$(sha256sum "$whl" | awk '{print $1}')"
+            url="${base_url}/$(urlquote "$base")"
+            tmp="$(mktemp)"; awk -F '\t' -v n="$base" '$1!=n' "$manifest" > "$tmp"
+            printf '%s\t%s\t%s\n' "$base" "$hash" "$url" >> "$tmp"; mv "$tmp" "$manifest"
+            n=$((n+1))
+          done
+          [ "$n" -gt 0 ] || { echo "no wheels to index"; exit 1; }
+
+          # package index page
+          { echo '<!doctype html><html><body>'
+            sort "$manifest" | while IFS=$'\t' read -r name hash url; do
+              [ -n "$name" ] && printf '<a href="%s#sha256=%s">%s</a><br/>\n' "$url" "$hash" "$name"
+            done
+            echo '</body></html>'; } > "${pkg_dir}/index.html"
+          # root index page
+          { echo '<!doctype html><html><body><a href="sparkinfer/">sparkinfer</a></body></html>'; } > gh-pages/index.html
+          touch gh-pages/.nojekyll
+
+      - name: Commit and push gh-pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          pushd gh-pages >/dev/null
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff --cached --quiet && { echo "no index changes"; exit 0; }
+          git commit -q -m "simple index: ${GITHUB_SHA}"
+          git push -q origin gh-pages
+          popd >/dev/null
