@@ -19,15 +19,38 @@ name: Build wheels (PCIe comm extensions, AOT)
 # outright by 12.8 -- and CUDA 13.0 still emits sm_86, so one toolkit covers
 # both deployed architectures and a second variant would buy nothing.
 #
+# The same invariant now covers the CuTe-DSL kernels. ~70 DSL modules used to
+# JIT at runtime and were not in the wheel at all. CUTLASS 4.6 supports real
+# AOT export -- JitCompiledFunction.dump_to_object writes an ELF with the host
+# launcher and the cubin, ExternalBinaryModule loads it in a different process
+# -- so the compiled objects are now captured on target hardware and shipped
+# inside the wheel as sparkinfer/_aot_cache/. See sparkinfer/_lib/aot.py.
+#
+# The capture cannot happen here: sparkinfer derives each kernel's compile spec
+# from live tensors inside run(), so producing the objects needs a GPU of the
+# target architecture. The dsl-aot-cache jobs below run on self-hosted runners
+# for exactly that, and the wheel jobs consume their artifact. A wheel without
+# that artifact still JITs in production, so building one requires setting
+# ALLOW_JIT_WHEEL explicitly.
+#
 # Consequence to keep in mind: these wheels are cp312-only and are bound to the
-# torch C++ ABI and CUDA major below, but the filename records neither. Do not
-# publish a wheel built against a different torch/CUDA under the same version.
+# torch C++ ABI and CUDA major below, but the filename records neither. setup.py
+# now writes sparkinfer/_build_info.json with both, and
+# sparkinfer._lib.build_info raises on mismatch when the PCIe extensions load,
+# so a mismatched wheel fails at load instead of at an undefined symbol.
 
 on:
   push:
     branches: [appmana/main, build-wheels]
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      allow_jit_wheel:
+        description: >-
+          Publish a wheel with no AOT'd CuTe-DSL kernels. The kernels then
+          compile inside the first live request. Off by default on purpose.
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -38,6 +61,13 @@ env:
   TORCH_VERSION: "2.13.0"
   CUDA_INDEX: "cu130"
   PYTHON_TAG: "cp312"
+  # Self-hosted runners that own a GPU of each target architecture. Set as repo
+  # variables so the labels are not hardcoded here; an unset label disables that
+  # architecture's capture job, which then fails the wheel assertion below
+  # rather than silently producing a JIT wheel.
+  AOT_RUNNER_X86: ${{ vars.SPARKINFER_AOT_RUNNER_X86 }}
+  AOT_RUNNER_AARCH64: ${{ vars.SPARKINFER_AOT_RUNNER_AARCH64 }}
+  ALLOW_JIT_WHEEL: ${{ inputs.allow_jit_wheel && '1' || '0' }}
 
 jobs:
   release-meta:
@@ -60,11 +90,81 @@ jobs:
           echo "tag_name=${tag}" >> "$GITHUB_OUTPUT"
           echo "release_name=sparkinfer ${tag}" >> "$GITHUB_OUTPUT"
 
+
+  # ------------------------------------------------------- CuTe-DSL AOT cache
+  # Runs on a self-hosted runner that owns a GPU of the target architecture,
+  # because sparkinfer computes each kernel's compile spec from live tensors
+  # inside run(). The warmup command is a repo variable
+  # (SPARKINFER_AOT_WARMUP_CMD) so the shapes it exercises track the deployed
+  # serving config -- the CUDA-graph capture sizes are what bound the batch
+  # axis of the decode compile key, and they change with --max-num-seqs and the
+  # speculative-decode length.
+  #
+  # `verify` fails the job when the captured cache does not cover the kernel
+  # ids in sparkinfer/_lib/aot_matrix.py, so a warmup that quietly stopped
+  # exercising a kernel cannot ship as a green AOT wheel.
+  dsl-aot-cache:
+    name: Capture CuTe-DSL AOT cache (${{ matrix.arch }})
+    if: ${{ vars.SPARKINFER_AOT_RUNNER_X86 != '' || vars.SPARKINFER_AOT_RUNNER_AARCH64 != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner_var: SPARKINFER_AOT_RUNNER_X86
+            cute_arch: sm_86
+          - arch: aarch64
+            runner_var: SPARKINFER_AOT_RUNNER_AARCH64
+            cute_arch: sm_121a
+    runs-on: ${{ vars[matrix.runner_var] || 'ubuntu-24.04' }}
+    steps:
+      - name: Skip when no runner is configured for this architecture
+        id: gate
+        run: |
+          set -euo pipefail
+          if [ -z "${{ vars[matrix.runner_var] }}" ]; then
+            echo "no ${{ matrix.runner_var }} configured; no AOT cache for ${{ matrix.arch }}"
+            echo "have_runner=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_runner=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.have_runner == '1'
+
+      - name: Capture and verify
+        if: steps.gate.outputs.have_runner == '1'
+        env:
+          WARMUP_CMD: ${{ vars.SPARKINFER_AOT_WARMUP_CMD }}
+          PYTHON: ${{ vars.SPARKINFER_AOT_PYTHON || 'python3' }}
+        run: |
+          set -euo pipefail
+          test -n "$WARMUP_CMD" || {
+            echo "SPARKINFER_AOT_WARMUP_CMD is unset; there is nothing to compile." >&2
+            exit 1
+          }
+          rm -rf build/aot
+          "$PYTHON" scripts/build_aot_cache.py capture \
+            --stage build/aot --arch "${{ matrix.cute_arch }}" -- \
+            bash -lc "$WARMUP_CMD"
+          "$PYTHON" scripts/build_aot_cache.py verify --stage build/aot
+
+      - uses: actions/upload-artifact@v4
+        if: steps.gate.outputs.have_runner == '1'
+        with:
+          name: sparkinfer-aot-cache-${{ matrix.arch }}
+          path: build/aot/**
+          if-no-files-found: error
+
   # ---------------------------------------------------------------- x86_64
   manylinux-wheel:
     name: Wheel (manylinux_2_28, x86_64)
     runs-on: ubuntu-24.04
-    needs: release-meta
+    needs: [release-meta, dsl-aot-cache]
+    # dsl-aot-cache is skipped when no self-hosted runner is configured; a
+    # skipped dependency must not skip the wheel, it must reach the
+    # assertion that decides whether a JIT wheel is allowed.
+    if: ${{ !cancelled() }}
     env:
       # The device code in the four .cu files is architecturally plain -- no
       # tcgen05, wgmma, cp.async.bulk, mbarrier or cluster instructions, and
@@ -88,6 +188,23 @@ jobs:
           swap-storage: false
 
       - uses: actions/checkout@v4
+
+      - name: Fetch the CuTe-DSL AOT cache captured on target hardware
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: sparkinfer-aot-cache-x86_64
+          path: build/aot
+
+      - name: Stage the AOT cache into the package tree
+        run: |
+          set -euo pipefail
+          if [ -d build/aot ] && [ -n "$(find build/aot -name '*.o' -print -quit)" ]; then
+            python3 scripts/build_aot_cache.py verify --stage build/aot
+            python3 scripts/build_aot_cache.py install --stage build/aot
+          else
+            echo 'no AOT cache artifact; the wheel assertion decides whether that is allowed'
+          fi
 
       - name: Build + repair manylinux_2_28 wheel in the pytorch cuda13 builder
         run: |
@@ -118,14 +235,19 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" dist_manylinux 2>/dev/null || true
           ls -la dist_manylinux/*.whl
 
-      - name: Assert the four AOT extensions are in the wheel
+      - name: Assert the wheel is AOT (extensions, DSL objects, build binding)
+        env:
+          ALLOW_JIT_WHEEL: ${{ env.ALLOW_JIT_WHEEL }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import glob, sys, zipfile
+          import glob, json, os, sys, zipfile
           wheels = glob.glob("dist_manylinux/*.whl")
           assert len(wheels) == 1, f"expected exactly one wheel, got {wheels}"
-          names = zipfile.ZipFile(wheels[0]).namelist()
+          zf = zipfile.ZipFile(wheels[0])
+          names = zf.namelist()
+
+          # 1. The four PCIe comm extensions.
           want = ["dma", "oneshot", "twoshot", "dcp_a2a"]
           missing = [
               w for w in want
@@ -138,9 +260,49 @@ jobs:
                   f"sparkinfer_pcie_{{{','.join(missing)}}}_ext*.so. torch was not "
                   f"importable at build time, or build isolation was in effect."
               )
+
+          # 2. The torch/CUDA binding the filename cannot express. Without this
+          #    a wheel built against another torch is indistinguishable.
+          info_names = [n for n in names if n.endswith("sparkinfer/_build_info.json")]
+          if not info_names:
+              sys.exit(f"{wheels[0]} carries no sparkinfer/_build_info.json")
+          info = json.loads(zf.read(info_names[0]))
+          if not info.get("extensions_built"):
+              sys.exit(f"{wheels[0]}: _build_info.json says extensions_built=false")
+          for field in ("torch_version", "torch_cuda_version"):
+              if not info.get(field):
+                  sys.exit(f"{wheels[0]}: _build_info.json has empty {field}")
+          if not str(info["torch_cuda_version"]).startswith("13."):
+              sys.exit(
+                  f"{wheels[0]}: built against CUDA {info['torch_cuda_version']}; "
+                  "sm_121 needs CUDA 13 and there is no cu128 variant"
+              )
+
+          # 3. The AOT'd CuTe-DSL kernel objects. Their absence means every DSL
+          #    kernel compiles inside the first live request -- the exact
+          #    failure this workflow exists to prevent -- so it fails unless
+          #    someone asked for a JIT wheel on purpose.
+          dsl = [n for n in names if "/sparkinfer/_aot_cache/" in f"/{n}" and n.endswith(".o")]
+          if not dsl:
+              if os.environ.get("ALLOW_JIT_WHEEL") == "1":
+                  print(
+                      f"WARNING: {wheels[0]} carries no AOT'd CuTe-DSL kernels; "
+                      "they will compile inside the first live request."
+                  )
+              else:
+                  sys.exit(
+                      f"{wheels[0]} carries no sparkinfer/_aot_cache/*.o. The "
+                      "dsl-aot-cache job did not produce an artifact for this "
+                      "architecture -- check SPARKINFER_AOT_RUNNER_* and "
+                      "SPARKINFER_AOT_WARMUP_CMD. Re-run with allow_jit_wheel "
+                      "only if a JIT wheel is genuinely what you want."
+                  )
+          else:
+              print(f"ok: {len(dsl)} AOT'd CuTe-DSL kernel object(s)")
+
           if "cp312" not in wheels[0] or "manylinux_2_28_x86_64" not in wheels[0]:
               sys.exit(f"unexpected wheel tag: {wheels[0]}")
-          print(f"ok: {wheels[0]}")
+          print(f"ok: {wheels[0]} torch={info['torch_version']} cuda={info['torch_cuda_version']}")
           PY
 
       - uses: actions/upload-artifact@v4
@@ -159,7 +321,8 @@ jobs:
   manylinux-wheel-aarch64:
     name: Wheel (manylinux_2_28, aarch64)
     runs-on: ubuntu-24.04-arm
-    needs: release-meta
+    needs: [release-meta, dsl-aot-cache]
+    if: ${{ !cancelled() }}
     env:
       # sparkinfer's device gate accepts compute capability 12.0 and 12.1 only
       # (sparkinfer/_lib/gating.py:29-32), and no aarch64 NVIDIA part ships
@@ -178,6 +341,23 @@ jobs:
           swap-storage: false
 
       - uses: actions/checkout@v4
+
+      - name: Fetch the CuTe-DSL AOT cache captured on target hardware
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: sparkinfer-aot-cache-aarch64
+          path: build/aot
+
+      - name: Stage the AOT cache into the package tree
+        run: |
+          set -euo pipefail
+          if [ -d build/aot ] && [ -n "$(find build/aot -name '*.o' -print -quit)" ]; then
+            python3 scripts/build_aot_cache.py verify --stage build/aot
+            python3 scripts/build_aot_cache.py install --stage build/aot
+          else
+            echo 'no AOT cache artifact; the wheel assertion decides whether that is allowed'
+          fi
 
       - name: Build + repair manylinux_2_28 aarch64 wheel in the pytorch cuda13 builder
         run: |
@@ -205,14 +385,19 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" dist_manylinux 2>/dev/null || true
           ls -la dist_manylinux/*.whl
 
-      - name: Assert the four AOT extensions are in the wheel
+      - name: Assert the wheel is AOT (extensions, DSL objects, build binding)
+        env:
+          ALLOW_JIT_WHEEL: ${{ env.ALLOW_JIT_WHEEL }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import glob, sys, zipfile
+          import glob, json, os, sys, zipfile
           wheels = glob.glob("dist_manylinux/*.whl")
           assert len(wheels) == 1, f"expected exactly one wheel, got {wheels}"
-          names = zipfile.ZipFile(wheels[0]).namelist()
+          zf = zipfile.ZipFile(wheels[0])
+          names = zf.namelist()
+
+          # 1. The four PCIe comm extensions.
           want = ["dma", "oneshot", "twoshot", "dcp_a2a"]
           missing = [
               w for w in want
@@ -225,9 +410,49 @@ jobs:
                   f"sparkinfer_pcie_{{{','.join(missing)}}}_ext*.so. torch was not "
                   f"importable at build time, or build isolation was in effect."
               )
+
+          # 2. The torch/CUDA binding the filename cannot express. Without this
+          #    a wheel built against another torch is indistinguishable.
+          info_names = [n for n in names if n.endswith("sparkinfer/_build_info.json")]
+          if not info_names:
+              sys.exit(f"{wheels[0]} carries no sparkinfer/_build_info.json")
+          info = json.loads(zf.read(info_names[0]))
+          if not info.get("extensions_built"):
+              sys.exit(f"{wheels[0]}: _build_info.json says extensions_built=false")
+          for field in ("torch_version", "torch_cuda_version"):
+              if not info.get(field):
+                  sys.exit(f"{wheels[0]}: _build_info.json has empty {field}")
+          if not str(info["torch_cuda_version"]).startswith("13."):
+              sys.exit(
+                  f"{wheels[0]}: built against CUDA {info['torch_cuda_version']}; "
+                  "sm_121 needs CUDA 13 and there is no cu128 variant"
+              )
+
+          # 3. The AOT'd CuTe-DSL kernel objects. Their absence means every DSL
+          #    kernel compiles inside the first live request -- the exact
+          #    failure this workflow exists to prevent -- so it fails unless
+          #    someone asked for a JIT wheel on purpose.
+          dsl = [n for n in names if "/sparkinfer/_aot_cache/" in f"/{n}" and n.endswith(".o")]
+          if not dsl:
+              if os.environ.get("ALLOW_JIT_WHEEL") == "1":
+                  print(
+                      f"WARNING: {wheels[0]} carries no AOT'd CuTe-DSL kernels; "
+                      "they will compile inside the first live request."
+                  )
+              else:
+                  sys.exit(
+                      f"{wheels[0]} carries no sparkinfer/_aot_cache/*.o. The "
+                      "dsl-aot-cache job did not produce an artifact for this "
+                      "architecture -- check SPARKINFER_AOT_RUNNER_* and "
+                      "SPARKINFER_AOT_WARMUP_CMD. Re-run with allow_jit_wheel "
+                      "only if a JIT wheel is genuinely what you want."
+                  )
+          else:
+              print(f"ok: {len(dsl)} AOT'd CuTe-DSL kernel object(s)")
+
           if "cp312" not in wheels[0] or "manylinux_2_28_aarch64" not in wheels[0]:
               sys.exit(f"unexpected wheel tag: {wheels[0]}")
-          print(f"ok: {wheels[0]}")
+          print(f"ok: {wheels[0]} torch={info['torch_version']} cuda={info['torch_cuda_version']}")
           PY
 
       - uses: actions/upload-artifact@v4
@@ -241,6 +466,7 @@ jobs:
     name: Publish release
     runs-on: ubuntu-24.04
     needs: [release-meta, manylinux-wheel, manylinux-wheel-aarch64]
+    if: ${{ !cancelled() && needs.manylinux-wheel.result == 'success' }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -269,6 +495,7 @@ jobs:
     name: Publish gh-pages PEP 503 simple index
     runs-on: ubuntu-24.04
     needs: [release-meta, manylinux-wheel, manylinux-wheel-aarch64, publish-release]
+    if: ${{ !cancelled() && needs.publish-release.result == 'success' }}
     steps:
       - uses: actions/download-artifact@v4
         with:
