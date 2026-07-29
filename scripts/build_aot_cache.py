@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Stage prebuilt CuTe-DSL kernel objects into the package for the wheel.
 
+This populates a cache; it does not establish a contract.  Anything it misses
+compiles on first use exactly as sparkinfer always did, so a partial capture is
+a partial speed-up and never a failure.
+
 Why this is a capture-and-stage step and not a self-contained compiler
 ---------------------------------------------------------------------
 CUTLASS 4.6 fully supports ahead-of-time export, and it does not need a GPU to
@@ -14,22 +18,30 @@ architecture without consulting a device
 ``CUDA_VISIBLE_DEVICES="" CUTE_DSL_ARCH=sm_86`` produced an object that a
 separate process loaded and ran correctly on a real sm_86 GPU.
 
-What is *not* device-free is reaching sparkinfer's ``compile()`` calls.  Every
-op derives its ``KernelCompileSpec`` from live tensors inside ``run()`` -- the
-compile arguments themselves are already fake pointers
-(``attention/_shared/contiguous/api.py:1052``), but the spec that selects them
-is computed from real shapes, dtypes, devices and from plan/bind scratch that
-is really allocated.  Driving that without a device would mean refactoring
-every op to expose a config-to-spec function.  Rather than claim a GPU-less
-build that does not exist, this script captures the cache from a real warmup on
-target hardware and ships what the warmup produced.
+What is *not* device-free is reaching sparkinfer's ``compile()`` calls.  The
+three attention families pass ``compile_args = runtime_args`` -- the compile
+arguments are live ``from_dlpack`` tensors over real CUDA memory, at
+``attention/_shared/mla/kernel.py:2449-2493``,
+``attention/_shared/mla/merge.py:556-561`` and
+``attention/_shared/mla/prefill_mg.py:3767-3786``.  Feeding those from
+shape-only phantoms is possible -- ``merge.py`` already does exactly that for
+its cache *key*, via ``_shape_only_scratch_tensor``
+(``attention/compressed_mla/_scratch.py:235-242``) -- but it is a real change to
+three hot launch paths, and since a missed configuration now costs one compile
+rather than an outage, it is not worth that risk today.  This script therefore
+captures the cache from a real warmup on target hardware.
+
+(The two MoE families are already device-free: ``_get_micro_kernel``
+(``moe/fused_moe/_impl.py:6586``) and ``_get_dynamic_kernel`` (``:7189``) take
+only scalars and use fake pointers throughout.  See
+``sparkinfer/_lib/aot_matrix.py`` for the follow-up that would exploit that.)
 
 Usage
 -----
   # 1. On a machine with the target GPU: run any warmup that exercises the
   #    production shapes -- normally the vLLM engine's own startup and CUDA
   #    graph capture -- with the compile cache redirected to a staging dir.
-  build_aot_cache.py capture --stage build/aot -- \
+  build_aot_cache.py capture --stage build/aot --arch sm_121a -- \
       python -m vllm.entrypoints.openai.api_server ...
 
   # 2. Check the staged cache covers what production launches.
@@ -62,7 +74,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT))
 
 from sparkinfer._lib.aot import AOT_CACHE_DIRNAME  # noqa: E402
-from sparkinfer._lib.aot_matrix import check_coverage  # noqa: E402
+from sparkinfer._lib.aot_matrix import TARGET_ARCHS, check_coverage  # noqa: E402
 
 _PACKAGE_CACHE = _REPO_ROOT / "sparkinfer" / AOT_CACHE_DIRNAME
 _ENV_SNAPSHOT = "capture_env.json"
@@ -86,6 +98,18 @@ def cmd_capture(args: argparse.Namespace) -> int:
     env["SPARKINFER_COMPILE_CACHE_DIR"] = str(stage)
     env["SPARKINFER_COMPILE_DISK_CACHE"] = "1"
     if args.arch:
+        # Setting this pins what the DSL code-generates for and, because the
+        # cache key carries the *resolved* arch, it must be one of the names a
+        # live device resolves to -- otherwise the objects key on a string
+        # nothing at runtime will ever produce.
+        if args.arch not in TARGET_ARCHS:
+            print(
+                f"[aot] FAIL: --arch {args.arch} is not one of {list(TARGET_ARCHS)}. "
+                "sparkinfer only runs on compute capability 12.0 and 12.1 "
+                "(sparkinfer/_lib/gating.py:29-32).",
+                file=sys.stderr,
+            )
+            return 1
         env["CUTE_DSL_ARCH"] = args.arch
     # A capture run is *supposed* to compile; the AOT miss guard must not turn
     # that into an error.
@@ -151,12 +175,16 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
     problems = check_coverage(observed)
     if problems:
-        print("[aot] FAIL: shipped cache would not cover production:", file=sys.stderr)
+        print(
+            "[aot] FAIL: this capture is below the coverage floor -- a warmup "
+            "that used to exercise these kernels no longer does:",
+            file=sys.stderr,
+        )
         for problem in problems:
             print(f"[aot]   - {problem}", file=sys.stderr)
         return 1
 
-    print("[aot] ok: coverage contract satisfied")
+    print("[aot] ok: capture meets the coverage floor")
     return 0
 
 
@@ -194,7 +222,8 @@ def main() -> int:
     capture.add_argument(
         "--arch",
         default="",
-        help="CUTE_DSL_ARCH for the child (e.g. sm_121a). Empty = detect.",
+        choices=("", *TARGET_ARCHS),
+        help="CUTE_DSL_ARCH for the child. Empty = detect from the local GPU.",
     )
     capture.add_argument("command", nargs=argparse.REMAINDER)
     capture.set_defaults(func=cmd_capture)

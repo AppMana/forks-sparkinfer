@@ -58,8 +58,45 @@ def test_readonly_dirs_are_searched_before_the_writable_cache(
     assert paths[-1] == compiler._cache_object_path(key)
 
 
+def test_editable_install_with_no_packaged_cache_is_unaffected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`pip install -e .` must behave exactly as it did before AOT existed.
+
+    No packaged cache, no staged cache, nothing set: the miss guard is off, the
+    lookup finds nothing to search, and a compile is free to proceed.
+    """
+    monkeypatch.delenv("SPARKINFER_REQUIRE_AOT", raising=False)
+    monkeypatch.delenv("SPARKINFER_AOT_CACHE_DIR", raising=False)
+
+    assert not aot.have_packaged_cache(), (
+        "a source checkout must not carry sparkinfer/_aot_cache; it is a build "
+        "output and is gitignored"
+    )
+    assert aot.readonly_cache_dirs() == ()
+    assert aot.require_aot() is False
+
+    # The lookup must still resolve to the writable per-user cache, i.e. the
+    # pre-AOT behaviour, rather than erroring on the absent packaged directory.
+    key = "cd" + "0" * 62
+    paths = [path for path, _packaged in compiler._iter_cache_object_paths(key)]
+    assert paths == [compiler._cache_object_path(key)]
+
+
+def test_jit_miss_is_a_warning_not_an_error_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cache is a cache. A miss compiles; it does not fail."""
+    monkeypatch.delenv("SPARKINFER_REQUIRE_AOT", raising=False)
+    aot.reset_aot_stats()
+    with pytest.warns(aot.AotCacheMissWarning):
+        aot.note_jit_compile(kernel_id="k", cache_key="0" * 64, detail="target=test")
+    assert aot.aot_info()["jit_compiles"] == 1
+    aot.reset_aot_stats()
+
+
 def test_jit_miss_raises_under_require_aot(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A miss must never be silent; under SPARKINFER_REQUIRE_AOT it must stop."""
+    """Opt-in only, for benchmark and CI runs where a compile skews the result."""
     monkeypatch.setenv("SPARKINFER_REQUIRE_AOT", "1")
     aot.reset_aot_stats()
     with pytest.raises(aot.AotCacheMiss) as excinfo:
@@ -69,6 +106,7 @@ def test_jit_miss_raises_under_require_aot(monkeypatch: pytest.MonkeyPatch) -> N
             detail="target=test",
         )
     assert "attention.mla.sm120.decode" in str(excinfo.value)
+    assert "SPARKINFER_REQUIRE_AOT" in str(excinfo.value)
 
 
 def test_jit_miss_warns_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -102,9 +140,25 @@ def test_operational_env_vars_do_not_change_the_compile_key(
     compiler._compile_environment_key.cache_clear()
 
 
-def test_coverage_contract_rejects_an_empty_cache() -> None:
+def test_coverage_floor_rejects_an_empty_capture() -> None:
     assert check_coverage({}) != []
     assert check_coverage({k: 99 for k in REQUIRED_KERNEL_IDS}) == []
+
+
+def test_target_archs_are_the_two_gated_capabilities() -> None:
+    """sm_86 must not be here: gating.py accepts 12.0 and 12.1 only."""
+    from sparkinfer._lib.aot_matrix import TARGET_ARCHS
+
+    assert TARGET_ARCHS == ("sm_120a", "sm_121a")
+
+
+def test_resolved_arch_prefers_the_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_120a")
+    aot.resolved_gpu_arch.cache_clear()
+    assert aot.resolved_gpu_arch() == "sm_120a"
+    aot.resolved_gpu_arch.cache_clear()
 
 
 def test_build_info_absent_in_a_source_checkout_is_not_an_error() -> None:
