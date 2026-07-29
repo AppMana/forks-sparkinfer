@@ -99,77 +99,62 @@ jobs:
 
 
   # ------------------------------------------------------- CuTe-DSL AOT cache
-  # A cache, not a contract. Everything it carries is a kernel a serving node
-  # would otherwise compile inside its first requests; everything it misses
-  # still compiles on first use exactly as before. So this job is allowed to be
-  # absent, and the wheel jobs below only report its absence.
+  # Runs on an ordinary hosted runner with no GPU. sparkinfer's launch paths
+  # now fabricate their compile-time argument descriptors instead of reusing
+  # live tensors (sparkinfer/_lib/aot_args.py), and CUTE_DSL_ARCH selects the
+  # target architecture without consulting a device, so the whole matrix
+  # compiles here.
   #
-  # Two GPU architectures, because sparkinfer only ever runs on two:
-  # sparkinfer/_lib/gating.py:29-32 accepts compute capability 12.0 and 12.1 and
-  # nothing else. sm_86 is not in this matrix -- Ampere is served by flash_mla
-  # and the vLLM fork's Triton kernels, and compressed_mla.is_supported() would
-  # refuse it anyway, so an sm_86 cubin here would be dead weight.
+  # Still a cache, not a contract: anything this job misses -- including
+  # anything it fails to compile, which it reports and does not raise on --
+  # compiles on first use exactly as before.
   #
-  # The arch names are the DSL's own resolved forms (sm_120a / sm_121a, per
-  # cutlass/base_dsl/runtime/cuda.py:139-145), because that is what a live
-  # device resolves to and therefore what the compile cache key must contain.
-  #
-  # Capture needs a GPU of the target architecture: sparkinfer derives each
-  # kernel's compile spec from live tensors inside run(). CUTLASS itself can
-  # code-generate for an arch it cannot see, but reaching those compile calls
-  # cannot, so these run on self-hosted runners that own the hardware.
+  # Two architectures, because sparkinfer only runs on two: gating.py:29-32
+  # accepts compute capability 12.0 and 12.1 and nothing else. The names carry
+  # the "a" suffix because that is what a live device resolves to, and the
+  # resolved name is what the compile cache key contains.
   dsl-aot-cache:
-    name: Capture CuTe-DSL AOT cache (${{ matrix.arch }})
-    if: ${{ vars.SPARKINFER_AOT_RUNNER_SM120 != '' || vars.SPARKINFER_AOT_RUNNER_SM121 != '' }}
+    name: Precompile CuTe-DSL kernels (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: sm_120a
-            runner_var: SPARKINFER_AOT_RUNNER_SM120
-            warmup_var: SPARKINFER_AOT_WARMUP_CMD_SM120
-          - arch: sm_121a
-            runner_var: SPARKINFER_AOT_RUNNER_SM121
-            warmup_var: SPARKINFER_AOT_WARMUP_CMD_SM121
-    runs-on: ${{ vars[matrix.runner_var] || 'ubuntu-24.04' }}
+        arch: [sm_120a, sm_121a]
     steps:
-      - name: Skip when no runner owns this architecture
-        id: gate
-        run: |
-          set -euo pipefail
-          if [ -z "${{ vars[matrix.runner_var] }}" ]; then
-            echo "no ${{ matrix.runner_var }} configured; ${{ matrix.arch }} kernels will JIT on first use"
-            echo "have_runner=0" >> "$GITHUB_OUTPUT"
-          else
-            echo "have_runner=1" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: actions/checkout@v4
-        if: steps.gate.outputs.have_runner == '1'
 
-      - name: Capture and verify
-        if: steps.gate.outputs.have_runner == '1'
-        env:
-          WARMUP_CMD: ${{ vars[matrix.warmup_var] }}
-          PYTHON: ${{ vars.SPARKINFER_AOT_PYTHON || 'python3' }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the DSL toolchain (no GPU, no CUDA toolkit)
         run: |
           set -euo pipefail
-          test -n "$WARMUP_CMD" || {
-            echo "${{ matrix.warmup_var }} is unset; there is nothing to compile." >&2
-            exit 1
-          }
-          rm -rf build/aot
-          "$PYTHON" scripts/build_aot_cache.py capture \
-            --stage build/aot --arch "${{ matrix.arch }}" -- \
-            bash -lc "$WARMUP_CMD"
-          # Strict here, and only here: the capture either exercised the
-          # configurations in sparkinfer/_lib/aot_matrix.py or it silently
-          # stopped doing so, and shipping the latter as if it were the former
-          # is the one thing this job must not do.
-          "$PYTHON" scripts/build_aot_cache.py verify --stage build/aot
+          python -m pip install -q -U pip
+          pip install -q "nvidia-cutlass-dsl==4.6.0" \
+            "nvidia-cutlass-dsl-libs-base==4.6.0" \
+            "nvidia-cutlass-dsl-libs-core==4.6.0" \
+            "nvidia-cutlass-dsl-libs-cu13==4.6.0" \
+            --index-url https://pypi.org/simple
+          pip install -q --index-url https://download.pytorch.org/whl/${CUDA_INDEX} \
+            torch==${TORCH_VERSION}
+          SPARKINFER_SKIP_EXT_BUILD=1 pip install -q -e . --no-deps
+
+      - name: Precompile the matrix with no device present
+        env:
+          # Belt and braces: the build must not depend on a GPU even if the
+          # runner ever grows one.
+          CUDA_VISIBLE_DEVICES: ""
+        run: |
+          set -euo pipefail
+          python scripts/build_aot_cache.py precompile \
+            --stage build/aot --arch "${{ matrix.arch }}" --sm-count 48
+
+      - name: Report coverage against the matrix floor
+        continue-on-error: true
+        run: python scripts/build_aot_cache.py verify --stage build/aot
 
       - uses: actions/upload-artifact@v4
-        if: steps.gate.outputs.have_runner == '1'
         with:
           name: sparkinfer-aot-cache-${{ matrix.arch }}
           path: build/aot/**
@@ -180,9 +165,8 @@ jobs:
     name: Wheel (manylinux_2_28, x86_64)
     runs-on: ubuntu-24.04
     needs: [release-meta, dsl-aot-cache]
-    # dsl-aot-cache is skipped when no self-hosted runner is configured; a
-    # skipped dependency must not skip the wheel, it must reach the
-    # assertion that decides whether a JIT wheel is allowed.
+    # A failed precompile must not block the wheel: the kernels it did not
+    # produce simply compile on first use.
     if: ${{ !cancelled() }}
     env:
       # The device code in the four .cu files is architecturally plain -- no

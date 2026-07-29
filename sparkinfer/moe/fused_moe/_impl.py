@@ -27,6 +27,7 @@ from sparkinfer._lib.intrinsics import (
     align_up,
     as_grouped_scale_view,
 )
+from sparkinfer._lib.aot_args import compile_stream
 from sparkinfer._lib.utils import (
     current_cuda_stream,
     get_max_active_clusters,
@@ -6692,7 +6693,7 @@ def _get_micro_kernel(
         barrier_fake,  # barrier_epoch
         Int32(compile_m),  # m_val
         Int32(1),  # grid_x
-        current_cuda_stream(),  # stream
+        compile_stream(),  # stream
         compile_spec=KernelCompileSpec.from_key(
             "integration.tp_moe.micro_direct",
             1,
@@ -7549,7 +7550,7 @@ def _get_dynamic_kernel(
         1,
         1,
         1,
-        current_cuda_stream(),
+        compile_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "integration.tp_moe.dynamic",
             1,
@@ -8411,7 +8412,7 @@ def _get_tiny_decode_kernel(
             dummy(cutlass.Int32),
             dummy(cutlass.Float32),
             dummy(cutlass.BFloat16),
-            current_cuda_stream(),
+            compile_stream(),
             compile_spec=KernelCompileSpec.from_key(
                 "integration.tp_moe.tiny_decode",
                 1,

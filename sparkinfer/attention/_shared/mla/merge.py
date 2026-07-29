@@ -10,7 +10,6 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32
-from cutlass.cute.runtime import from_dlpack
 
 from sparkinfer.attention._shared.cute import ops as attention_ops
 from sparkinfer.attention._shared.workspace import _SPLIT_MAX_CHUNKS
@@ -20,7 +19,7 @@ from sparkinfer._lib.compiler import (
     launch as sparkinfer_launch,
     tensor_compile_fact,
 )
-from sparkinfer._lib.utils import current_cuda_stream
+from sparkinfer._lib.aot_args import compile_stream, to_cute_arg
 
 from .decode_math import _exp2_approx_ftz_f32
 from .reference import _MLA_GROUP_SIZE, _MLA_NOPE_DIM
@@ -136,14 +135,16 @@ def _to_kernel_tensor(
     *,
     assumed_align: int = 16,
 ) -> cute.Tensor:
-    cute_tensor = from_dlpack(tensor, assumed_align=assumed_align)
-    cute_tensor.element_type = dtype
-    leading_dim = next(
-        (idx for idx, stride in enumerate(tensor.stride()) if stride == 1), None
+    # min_ndim=2 preserves this site's guard exactly: unlike kernel.py and
+    # prefill_mg.py, merge leaves rank-1 tensors static. Unifying that would
+    # change the emitted layout and recompile every merge kernel.
+    return to_cute_arg(
+        tensor,
+        dtype,
+        align=assumed_align,
+        dynamic_layout=True,
+        min_ndim=2,
     )
-    if leading_dim is not None and tensor.ndim >= 2:
-        cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
-    return cute_tensor
 
 
 def _tensor_meta_key(
@@ -504,7 +505,7 @@ def _sparse_mla_split_decode_merge_flat_launch(
             _to_kernel_tensor(tmp_lse, cutlass.Float32, assumed_align=4),
             _to_kernel_tensor(num_chunks_ptr, cutlass.Int32, assumed_align=4),
             _to_kernel_tensor(output, _torch_to_cutlass_dtype(output.dtype)),
-            current_cuda_stream(),
+            compile_stream(),
         )
         merge_cache_key = (
             _tensor_compile_key(
@@ -558,7 +559,7 @@ def _sparse_mla_split_decode_merge_flat_launch(
         _to_kernel_tensor(num_chunks_ptr, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(attn_sink, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(output, _torch_to_cutlass_dtype(output.dtype)),
-        current_cuda_stream(),
+        compile_stream(),
     )
     merge_cache_key = (
         _tensor_compile_key(

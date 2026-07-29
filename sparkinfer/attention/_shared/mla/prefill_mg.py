@@ -17,7 +17,6 @@ import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
 import torch
 from cutlass import Float32, Int32, Int64, Uint32
-from cutlass.cute.runtime import from_dlpack
 
 from sparkinfer.attention._shared.cute.ops import LOG2_E
 from sparkinfer._lib.compiler import (
@@ -26,6 +25,7 @@ from sparkinfer._lib.compiler import (
     key_field,
     tensor_key,
 )
+from sparkinfer._lib.aot_args import compile_stream, to_cute_arg
 from sparkinfer._lib.compiler import launch as sparkinfer_launch
 from sparkinfer._lib.intrinsics import (
     atomic_max_shared_f32_offset,
@@ -163,15 +163,10 @@ def _wfp8_row_xor(row: Int32) -> Int32:
 
 
 def _to_cute(x, dtype, align=16, dynamic_layout=False):
-    c = from_dlpack(x, assumed_align=align)
-    c.element_type = dtype
-    if dynamic_layout and x.ndim >= 1:
-        leading_dim = next(
-            (idx for idx, stride in enumerate(x.stride()) if stride == 1), None
-        )
-        if leading_dim is not None:
-            c = c.mark_layout_dynamic(leading_dim=leading_dim)
-    return c
+    # Delegates so the AOT builder can pass a FakeCudaTensor and get the
+    # signature-identical descriptor without a device. A real torch.Tensor takes
+    # the original from_dlpack path unchanged; see sparkinfer/_lib/aot_args.py.
+    return to_cute_arg(x, dtype, align=align, dynamic_layout=dynamic_layout)
 
 
 def _cache_base_tensor(cache: torch.Tensor) -> torch.Tensor:
@@ -3762,7 +3757,9 @@ def _sparse_mla_prefill_mg_flat_launch(
         valid_hpb=valid_hpb,
         pack_hilo_rows=pack_hilo_rows,
     )
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    # compile_stream() is the live stream for a launch and a fake one
+    # during an AOT build, where there is no context to ask.
+    stream = compile_stream()
     base_args = (
         _to_cute(q, cutlass.BFloat16, dynamic_layout=True),
         _to_cute(kv_flat, cutlass.Uint8, align=16),

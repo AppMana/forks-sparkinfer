@@ -2809,4 +2809,11 @@ def launch(
         compile_spec=compile_spec,
         **(compile_kwargs or {}),
     )
+    from .aot_args import compile_only_mode
+
+    if compile_only_mode():
+        # An AOT build drove the launch path to reach this compile. The
+        # descriptors behind compile_args have no memory, so there is nothing
+        # to run and running is not the point.
+        return None
     return run_compiled(compiled, runtime_args)

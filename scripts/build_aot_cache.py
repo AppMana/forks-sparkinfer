@@ -125,6 +125,67 @@ def cmd_capture(args: argparse.Namespace) -> int:
     return completed.returncode
 
 
+def cmd_precompile(args: argparse.Namespace) -> int:
+    """Compile the configuration matrix with no GPU present.
+
+    This is the primary way to populate the cache. It drives the real launch
+    paths with fabricated argument descriptors (sparkinfer/_lib/aot_args.py),
+    so the compile specs are computed by the same code production uses -- but
+    nothing is allocated and nothing is executed.
+    """
+    import os
+
+    stage = Path(args.stage).resolve()
+    stage.mkdir(parents=True, exist_ok=True)
+
+    if args.arch not in TARGET_ARCHS:
+        print(
+            f"[aot] FAIL: --arch {args.arch} is not one of {list(TARGET_ARCHS)}.",
+            file=sys.stderr,
+        )
+        return 1
+
+    os.environ["CUTE_DSL_ARCH"] = args.arch
+    os.environ["SPARKINFER_COMPILE_CACHE_DIR"] = str(stage)
+    os.environ["SPARKINFER_COMPILE_DISK_CACHE"] = "1"
+    os.environ["SPARKINFER_REQUIRE_AOT"] = "0"
+    os.environ.setdefault("SPARKINFER_AOT_NUM_SM", str(args.sm_count))
+
+    (stage / _ENV_SNAPSHOT).write_text(
+        json.dumps(_key_env(dict(os.environ)), indent=2, sort_keys=True) + "\n"
+    )
+
+    import warnings
+
+    from sparkinfer._lib.aot import AotCacheMissWarning
+    from sparkinfer._lib.aot_precompile import Deployment, precompile
+
+    # Every compile here is by definition a miss; the per-kernel note is the
+    # thing this command exists to eliminate later, not to hear now.
+    warnings.simplefilter("ignore", AotCacheMissWarning)
+
+    print(f"[aot] precompiling for {args.arch} into {stage}", flush=True)
+    results = precompile(Deployment(sm_count=args.sm_count))
+
+    failed = [r for r in results if not r.ok]
+    print(
+        f"[aot] {len(results) - len(failed)}/{len(results)} configurations compiled",
+        flush=True,
+    )
+    if failed:
+        # Not fatal: a configuration that will not compile ahead of time simply
+        # compiles on first use, exactly as before. It is reported so it can be
+        # fixed, and so nobody believes coverage they do not have.
+        print(
+            f"[aot] {len(failed)} configuration(s) could not be compiled ahead "
+            "of time and will JIT on first use:",
+            file=sys.stderr,
+        )
+        for result in failed:
+            print(f"[aot]   - {result.name}: {result.detail}", file=sys.stderr)
+    return 0
+
+
 def _manifests(stage: Path) -> list[dict]:
     out = []
     for path in sorted(stage.rglob("*.json")):
@@ -231,6 +292,19 @@ def main() -> int:
     verify = sub.add_parser("verify", help="check the staged cache covers production")
     verify.add_argument("--stage", required=True)
     verify.set_defaults(func=cmd_verify)
+
+    pre = sub.add_parser(
+        "precompile", help="compile the matrix with no GPU (the normal path)"
+    )
+    pre.add_argument("--stage", required=True)
+    pre.add_argument("--arch", required=True, choices=TARGET_ARCHS)
+    pre.add_argument(
+        "--sm-count",
+        type=int,
+        default=48,
+        help="SMs on the target. 48 = GB10. Enters the decode split policy.",
+    )
+    pre.set_defaults(func=cmd_precompile)
 
     install = sub.add_parser("install", help="copy the staged cache into the package")
     install.add_argument("--stage", required=True)
