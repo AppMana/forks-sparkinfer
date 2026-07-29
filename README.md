@@ -173,11 +173,12 @@ hardware validation. Do not treat either result as model-level validation of
 the SparkInfer NVFP4 path.
 
 Hilton's working `appmana/deepseek-v4-int4-int8` lane is a useful control but
-does not call SparkInfer: it selects native FlashMLA over an `int8_ds_mla`
-cache, Marlin INT4 experts, and the vLLM Triton/torch mHC fallback. Its
-correctness therefore does not validate this library's NVFP4 integration. The
-full topology, kernel ownership, public comparison numbers, and
-missing-evidence register live in the
+its proven core selects native FlashMLA over an `int8_ds_mla` cache and Marlin
+INT4 experts. That correctness does not validate this library's NVFP4
+integration or `norm.mhc`. A narrow shared-mHC integration is being evaluated
+for GB12x, but it is not active or live-proven and must not be generalized into
+a checkpoint-wide “SparkInfer INT4 lane.” The full topology, kernel ownership,
+public comparison numbers, and missing-evidence register live in the
 [Hilton performance reference](https://github.com/hannesholste/dragonintel/blob/main/docs/dsv4-spark-performance-references.md).
 
 ## Where to look next
