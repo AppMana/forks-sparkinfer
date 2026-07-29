@@ -31,6 +31,13 @@ def load_ext(
     JIT build name.
     """
     if os.getenv(_FORCE_JIT_ENV, "0") != "1":
+        # A torch/CUDA mismatch surfaces here as an undefined-symbol
+        # ImportError, which is indistinguishable from "never built" and used
+        # to degrade into a silent nvcc run inside the caller.  Check the
+        # recorded build metadata first so the real cause is what gets raised.
+        from sparkinfer._lib.build_info import check_runtime_compatibility
+
+        check_runtime_compatibility()
         try:
             return importlib.import_module(name)
         except ImportError:

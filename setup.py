@@ -1,21 +1,38 @@
-"""Build the PCIe comm CUDA extensions at install time.
+"""Build the PCIe comm CUDA extensions at install time and record the binding.
 
 Without this the extensions are compiled by torch.utils.cpp_extension.load()
 on first call, which moves an nvcc run into the first inference request and
 requires a compiler and a writable cache on the serving node.
 
-Falls back to a pure-Python install when torch is unavailable at build time;
-sparkinfer/comm/pcie/_ext.py then JIT-compiles on demand.
+Two things are emitted besides the extensions:
+
+* ``sparkinfer/_build_info.json`` -- the torch version, torch's CUDA version
+  and the arch lists this wheel was built against.  The wheel filename records
+  none of them (there is no torch or CUDA field in a PEP 425 tag), so the
+  binding is recorded inside the wheel and enforced at load time by
+  ``sparkinfer._lib.build_info``.  Publishing a wheel built against a different
+  torch under the same version is still *possible*; it is no longer *silent*.
+* ``sparkinfer/_aot_cache/`` -- prebuilt CuTe-DSL kernel objects, staged by
+  ``scripts/build_aot_cache.py`` before this runs.  Present or absent it is
+  packaged verbatim; the CI workflow is what asserts it is non-empty.
+
+Falls back to a pure-Python install when torch is unavailable at build time.
+That fallback is a trap -- torch is deliberately NOT in build-system.requires,
+so a default isolated PEP 517 build always takes it -- which is why every
+supported build path goes through .github/workflows/wheels.yaml, which never
+builds under isolation and asserts the artifacts are in the resulting wheel.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 from setuptools import setup
 
-_PCIE = Path("sparkinfer/comm/pcie")
+_PACKAGE = Path("sparkinfer")
+_PCIE = _PACKAGE / "comm" / "pcie"
 
 # module name -> source, matching the names load_ext() imports.
 _EXTENSIONS = {
@@ -29,12 +46,41 @@ _EXTENSIONS = {
 _SKIP = os.getenv("SPARKINFER_SKIP_EXT_BUILD", "0") == "1"
 
 
+def _write_build_info(extensions_built: bool) -> None:
+    """Record what this wheel is bound to, next to the code that checks it."""
+    info: dict[str, object] = {
+        "extensions_built": extensions_built,
+        "torch_cuda_arch_list": os.getenv("TORCH_CUDA_ARCH_LIST", ""),
+        "cute_dsl_arch": os.getenv("CUTE_DSL_ARCH", ""),
+    }
+    try:
+        import torch
+
+        info["torch_version"] = str(torch.__version__)
+        info["torch_cuda_version"] = str(getattr(torch.version, "cuda", "") or "")
+    except ImportError:
+        info["torch_version"] = ""
+        info["torch_cuda_version"] = ""
+    try:
+        import importlib.metadata as _metadata
+
+        info["cutlass_dsl_version"] = _metadata.version("nvidia-cutlass-dsl")
+    except Exception:
+        info["cutlass_dsl_version"] = ""
+
+    (_PACKAGE / "_build_info.json").write_text(
+        json.dumps(info, indent=2, sort_keys=True) + "\n"
+    )
+
+
 def _build_kwargs() -> dict:
     if _SKIP:
+        _write_build_info(False)
         return {}
     try:
         from torch.utils.cpp_extension import BuildExtension, CUDAExtension
     except ImportError:
+        _write_build_info(False)
         return {}
 
     # TORCH_CUDA_ARCH_LIST governs the SASS; the caller sets it (the image
@@ -50,7 +96,9 @@ def _build_kwargs() -> dict:
         if src.exists()
     ]
     if not ext_modules:
+        _write_build_info(False)
         return {}
+    _write_build_info(True)
     return {
         "ext_modules": ext_modules,
         "cmdclass": {"build_ext": BuildExtension.with_options(use_ninja=True)},

@@ -37,6 +37,11 @@ include = ["sparkinfer*"]
 
 [tool.setuptools.package-data]
 "sparkinfer.comm.pcie" = ["*.cu"]
+# _build_info.json records the torch/CUDA binding the wheel filename cannot
+# express; _aot_cache carries the prebuilt CuTe-DSL kernel objects staged by
+# scripts/build_aot_cache.py.  Both are generated, so they are matched by glob
+# rather than listed.
+"sparkinfer" = ["_build_info.json", "_aot_cache/**/*.o", "_aot_cache/**/*.json"]
 
 [tool.ruff.lint]
 select = ["E", "F", "B", "SIM"]
