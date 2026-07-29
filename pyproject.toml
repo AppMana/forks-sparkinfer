@@ -28,7 +28,19 @@ dev = [
 ]
 
 [build-system]
-requires = ["setuptools>=77", "packaging>=24"]
+# torch belongs here. setup.py builds the PCIe comm extensions only if it can
+# import torch.utils.cpp_extension and returns {} otherwise, so leaving torch
+# out meant the default isolated PEP 517 build ALWAYS produced a pure-Python
+# wheel with no extensions -- silently, and indistinguishably from a wheel
+# whose extensions had simply never been requested. Every downstream guard
+# (--no-build-isolation, the in-wheel .so assertions, the build-info check)
+# exists to compensate for that hole; closing it here is the actual fix.
+#
+# The pin is the ABI the wheel is bound to, not a floor: the extensions link
+# against torch's C++ ABI, so a wheel built here only loads against a matching
+# torch. sparkinfer/_build_info.json records what was used and _lib/build_info
+# checks it before the extension import.
+requires = ["setuptools>=77", "packaging>=24", "torch==2.13.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
