@@ -156,6 +156,30 @@ Set `SPARKINFER_PRINT_COMPILE_PROGRESS=1` to log each compiler invocation with i
 cache-key parameters and duration — useful for figuring out what warmup
 actually covered. `SPARKINFER_TIMING=1` enables per-kernel timing logs.
 
+## Downstream DeepSeek-V4 status
+
+The AppMana vLLM fork integrates `attention.compressed_mla`,
+`attention.nsa_indexer`, and `moe.fused_moe` for its experimental
+`appmana/deepseek-v4-nvfp4-fp8` lane on two DGX Sparks. That lane currently
+serves but does **not** generate correct text, with or without speculative
+decoding; it has no valid performance result.
+
+Two bugs have been isolated in the downstream vLLM weight adapter rather than
+in this repository's public API. The first restores ModelOpt's reciprocal
+activation-global-scale contract and changed live logits without making them
+correct. The second reorders fused FC1 gate/up storage and swizzles block
+scales; it passes offline regression tests but still awaits end-to-end
+hardware validation. Do not treat either result as model-level validation of
+the SparkInfer NVFP4 path.
+
+Hilton's working `appmana/deepseek-v4-int4-int8` lane is a useful control but
+does not use SparkInfer for sparse MLA or routed MoE: it selects native
+FlashMLA over an `int8_ds_mla` cache and Marlin INT4 experts. Its correctness
+therefore does not validate this library's NVFP4 integration. The full
+topology, kernel ownership, public comparison numbers, and missing-evidence
+register live in the
+[Hilton performance reference](https://github.com/hannesholste/dragonintel/blob/main/docs/dsv4-spark-performance-references.md).
+
 ## Where to look next
 
 - `tests/` is the executable spec — per-group API and numerical-reference
