@@ -68,12 +68,6 @@ env:
   TORCH_VERSION: "2.13.0"
   CUDA_INDEX: "cu130"
   PYTHON_TAG: "cp312"
-  # Self-hosted runners that own a GPU of each target architecture. Set as repo
-  # variables so the labels are not hardcoded here; an unset label disables that
-  # architecture's capture job, which then fails the wheel assertion below
-  # rather than silently producing a JIT wheel.
-  AOT_RUNNER_X86: ${{ vars.SPARKINFER_AOT_RUNNER_X86 }}
-  AOT_RUNNER_AARCH64: ${{ vars.SPARKINFER_AOT_RUNNER_AARCH64 }}
   REQUIRE_DSL_AOT: ${{ inputs.require_dsl_aot && '1' || '0' }}
 
 jobs:
@@ -337,8 +331,8 @@ jobs:
               message = (
                   f"{wheels[0]} carries no sparkinfer/_aot_cache/*.o, so every "
                   "CuTe-DSL kernel will compile on first use. Configure "
-                  "SPARKINFER_AOT_RUNNER_SM120 / _SM121 and the matching "
-                  "SPARKINFER_AOT_WARMUP_CMD_* to populate it."
+                  "the dsl-aot-cache job -- it needs no GPU, so its absence "
+                  "here means it failed rather than that it was unavailable."
               )
               if os.environ.get("REQUIRE_DSL_AOT") == "1":
                   sys.exit(message)
@@ -488,8 +482,8 @@ jobs:
               message = (
                   f"{wheels[0]} carries no sparkinfer/_aot_cache/*.o, so every "
                   "CuTe-DSL kernel will compile on first use. Configure "
-                  "SPARKINFER_AOT_RUNNER_SM120 / _SM121 and the matching "
-                  "SPARKINFER_AOT_WARMUP_CMD_* to populate it."
+                  "the dsl-aot-cache job -- it needs no GPU, so its absence "
+                  "here means it failed rather than that it was unavailable."
               )
               if os.environ.get("REQUIRE_DSL_AOT") == "1":
                   sys.exit(message)
