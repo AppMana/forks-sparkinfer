@@ -17,10 +17,12 @@ Two things are emitted besides the extensions:
   packaged verbatim; the CI workflow is what asserts it is non-empty.
 
 Falls back to a pure-Python install when torch is unavailable at build time.
-That fallback is a trap -- torch is deliberately NOT in build-system.requires,
-so a default isolated PEP 517 build always takes it -- which is why every
-supported build path goes through .github/workflows/wheels.yaml, which never
-builds under isolation and asserts the artifacts are in the resulting wheel.
+torch is in build-system.requires, so an isolated PEP 517 build reaches the
+real path and that fallback is now only for a deliberately torch-less
+environment (SPARKINFER_SKIP_EXT_BUILD, or a docs build). It stays silent by
+design -- setup.py cannot know whether the caller wanted extensions -- so the
+loudness lives one level up, in the in-wheel assertions in
+.github/workflows/wheels.yaml.
 """
 
 from __future__ import annotations

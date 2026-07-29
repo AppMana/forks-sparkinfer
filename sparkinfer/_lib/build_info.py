@@ -104,7 +104,8 @@ def check_runtime_compatibility(*, strict: bool = True) -> list[str]:
             + "; ".join(problems)
             + ". The wheel filename does not encode either, so pip cannot have "
             "caught this. Install the wheel built for this torch/CUDA, or "
-            "reinstall from source with `pip install --no-build-isolation .`."
+            "rebuild from source with `pip install .` -- torch is in "
+            "build-system.requires, so that rebuilds the extensions."
         )
     return problems
 
