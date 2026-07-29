@@ -4,6 +4,12 @@
 LLM inference. It specifically targets DGX Spark, RTX Spark and the
 Blackwell-based RTX cards (RTX 6000 Pro, RTX 5090).
 
+The Hilton DeepSeek-V4 INT4/INT8 LeaderWorkerSet currently runs an older image
+that does **not** contain the downstream vLLM shared-mHC adapter. Its C1 15k and
+clean C2 1k acceptance arms ended in two-rank Xid 31 faults, so those failures
+are evidence about that older TileLang-mHC rollout, not evidence for or against
+the offline SparkInfer adapter described below.
+
 It is *not* intended to be used in production/datacenter environments, both due to
 architecture mismatches and the fast-moving pace of the library. For mission-critical
 use cases please use FlashInfer, CUTLASS or TRTLLM.
