@@ -30,12 +30,15 @@ from sparkinfer._lib.intrinsics import (
     cp_async_u32_shared_global,
     frag_layout_swizzle_16b_to_8b,
     get_ptr_as_int64,
+    ld_global_nc_f32,
+    ld_global_nc_u32,
     ld_global_v4_u32,
     ld_shared_v4_u32,
     ldmatrix_m8n8x2_b16,
     ldmatrix_m8n8x4_b16,
     ldmatrix_m8n8x4_left_half_b16,
     ldmatrix_m8n8x4_right_half_b16,
+    imma_m16n8k32_s32_s8,
     mxfp8_mma_m16n8k32_f32_e4m3,
     shared_ptr_to_u32,
     st_shared_v4_u32,
@@ -411,6 +414,12 @@ def _needs_paged_index_k_scalar_load(
     index_k_cache: torch.Tensor,
     k_quant_bytes: torch.Tensor,
 ) -> bool:
+    # vLLM's live INT8 cache is an interleaved view whose physical page stride
+    # is much larger than one logical 64-token page.  Load it with the explicit
+    # Int64 address path: page ids in the serving pool routinely make
+    # ``page_id * stride(0)`` exceed signed 32-bit range.
+    if index_k_cache.ndim == 4:
+        return True
     # Real serving caches are large enough for the normal TMA path. Tiny
     # strided caches appear in fake/warmup runs and should still be valid, so
     # load those pages cooperatively instead of depending on tiny strided TMA
@@ -499,15 +508,29 @@ def _repack_k_page_to_permuted(
 def _load_index_k_page_scalar(
     k_quant_bytes: cute.Tensor,
     page_id: Int32,
-    s_k_page_stage: cute.Tensor,
+    k_linear_base_addr: Int32,
     lane_linear: Int32,
+    page_stride_bytes: cutlass.Constexpr[int],
+    row_stride_bytes: cutlass.Constexpr[int],
 ):
     linear = lane_linear
-    total = Int32(_PAGE_SIZE * _INDEX_HEAD_DIM)
+    total = Int32(_PAGE_SIZE * (_INDEX_HEAD_DIM // 16))
+    page_base = Int64(page_id) * Int64(int(page_stride_bytes))
     while linear < total:
-        row = linear // Int32(_INDEX_HEAD_DIM)
-        col = linear - row * Int32(_INDEX_HEAD_DIM)
-        s_k_page_stage[row, col, Int32(0)] = k_quant_bytes[page_id, row, col]
+        row = linear // Int32(_INDEX_HEAD_DIM // 16)
+        vec_idx = linear - row * Int32(_INDEX_HEAD_DIM // 16)
+        src_addr = get_ptr_as_int64(
+            k_quant_bytes,
+            page_base
+            + Int64(row) * Int64(int(row_stride_bytes))
+            + Int64(vec_idx) * Int64(16),
+        )
+        dst_addr = k_linear_base_addr + Int32(row * _INDEX_HEAD_DIM + vec_idx * 16)
+        v0 = ld_global_nc_u32(src_addr)
+        v1 = ld_global_nc_u32(src_addr + Int64(4))
+        v2 = ld_global_nc_u32(src_addr + Int64(8))
+        v3 = ld_global_nc_u32(src_addr + Int64(12))
+        st_shared_v4_u32(dst_addr, v0, v1, v2, v3)
         linear += Int32(_PAGED_THREADS_PER_CTA)
 
 
@@ -539,14 +562,19 @@ def _compute_mxfp8_tile_partials(
     partial_row_base: Int32,
     head_tile_slot: Int32,
     score_mode: cutlass.Constexpr[int] = IndexerScoreMode.NSA_RELU_SUM,
+    qk_int8: cutlass.Constexpr[bool] = False,
 ):
     group_id = lane // Int32(4)
     thread_id_in_group = lane % Int32(4)
     col_pair_base = thread_id_in_group * Int32(2)
-    q0_acc = Float32(0.0)
-    q1_acc = Float32(0.0)
-    q2_acc = Float32(0.0)
-    q3_acc = Float32(0.0)
+    q0_acc_fp8 = Float32(0.0)
+    q1_acc_fp8 = Float32(0.0)
+    q2_acc_fp8 = Float32(0.0)
+    q3_acc_fp8 = Float32(0.0)
+    q0_acc_int8 = Int32(0)
+    q1_acc_int8 = Int32(0)
+    q2_acc_int8 = Int32(0)
+    q3_acc_int8 = Int32(0)
     k_offset = _permuted_offset_128b(
         token_base + Int32(8) * (lane // Int32(16)) + lane % Int32(8),
         (lane % Int32(16)) // Int32(8),
@@ -579,24 +607,42 @@ def _compute_mxfp8_tile_partials(
             Int32(16),
             Int32(_INDEX_HEAD_DIM // 16),
         )
-        d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
-            q0_acc,
-            q1_acc,
-            q2_acc,
-            q3_acc,
-            q0,
-            q1,
-            q2,
-            q3,
-            b0_k0,
-            b0_k1,
-            Uint32(0x7F7F7F7F),
-            Uint32(0x7F7F7F7F),
-        )
-        q0_acc = d0
-        q1_acc = d1
-        q2_acc = d2
-        q3_acc = d3
+        if cutlass.const_expr(qk_int8):
+            d0_i, d1_i, d2_i, d3_i = imma_m16n8k32_s32_s8(
+                q0_acc_int8,
+                q1_acc_int8,
+                q2_acc_int8,
+                q3_acc_int8,
+                q0,
+                q1,
+                q2,
+                q3,
+                b0_k0,
+                b0_k1,
+            )
+            q0_acc_int8 = d0_i
+            q1_acc_int8 = d1_i
+            q2_acc_int8 = d2_i
+            q3_acc_int8 = d3_i
+        else:
+            d0_f, d1_f, d2_f, d3_f = mxfp8_mma_m16n8k32_f32_e4m3(
+                q0_acc_fp8,
+                q1_acc_fp8,
+                q2_acc_fp8,
+                q3_acc_fp8,
+                q0,
+                q1,
+                q2,
+                q3,
+                b0_k0,
+                b0_k1,
+                Uint32(0x7F7F7F7F),
+                Uint32(0x7F7F7F7F),
+            )
+            q0_acc_fp8 = d0_f
+            q1_acc_fp8 = d1_f
+            q2_acc_fp8 = d2_f
+            q3_acc_fp8 = d3_f
         k_offset = _advance_offset_by_column_128b_2(k_offset_cur, mma_pair) - Int32(
             16 * (_INDEX_HEAD_DIM // 16)
         )
@@ -611,16 +657,26 @@ def _compute_mxfp8_tile_partials(
         w1 = Float32(s_w[head1])
     col0 = col_pair_base
     col1 = col_pair_base + Int32(1)
-    if cutlass.const_expr(score_mode == IndexerScoreMode.MSA_BILINEAR):
-        partial0 = Float32(q0_acc * w0)
-        partial0 = Float32(partial0 + q2_acc * w1)
-        partial1 = Float32(q1_acc * w0)
-        partial1 = Float32(partial1 + q3_acc * w1)
+    if cutlass.const_expr(qk_int8):
+        q0_score = Float32(q0_acc_int8)
+        q1_score = Float32(q1_acc_int8)
+        q2_score = Float32(q2_acc_int8)
+        q3_score = Float32(q3_acc_int8)
     else:
-        partial0 = Float32(attention_ops.fmax(q0_acc, Float32(0.0)) * w0)
-        partial0 = Float32(partial0 + attention_ops.fmax(q2_acc, Float32(0.0)) * w1)
-        partial1 = Float32(attention_ops.fmax(q1_acc, Float32(0.0)) * w0)
-        partial1 = Float32(partial1 + attention_ops.fmax(q3_acc, Float32(0.0)) * w1)
+        q0_score = q0_acc_fp8
+        q1_score = q1_acc_fp8
+        q2_score = q2_acc_fp8
+        q3_score = q3_acc_fp8
+    if cutlass.const_expr(score_mode == IndexerScoreMode.MSA_BILINEAR):
+        partial0 = Float32(q0_score * w0)
+        partial0 = Float32(partial0 + q2_score * w1)
+        partial1 = Float32(q1_score * w0)
+        partial1 = Float32(partial1 + q3_score * w1)
+    else:
+        partial0 = Float32(attention_ops.fmax(q0_score, Float32(0.0)) * w0)
+        partial0 = Float32(partial0 + attention_ops.fmax(q2_score, Float32(0.0)) * w1)
+        partial1 = Float32(attention_ops.fmax(q1_score, Float32(0.0)) * w0)
+        partial1 = Float32(partial1 + attention_ops.fmax(q3_score, Float32(0.0)) * w1)
     partial0 = _reduce_column_pair_sum(partial0)
     partial1 = _reduce_column_pair_sum(partial1)
     if group_id == Int32(0):
@@ -766,6 +822,11 @@ class SparseNSAPagedLogitsKernel:
         tile_block_q: int = _PAGED_TILED_BLOCK_Q,
         tile_block_k: int = _PAGED_TILED_BLOCK_K,
         score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
+        qk_int8: bool = False,
+        k_quant_page_stride: int = _PAGE_SIZE * _INDEX_HEAD_DIM,
+        k_quant_row_stride: int = _INDEX_HEAD_DIM,
+        k_scales_page_stride: int = _PAGE_SIZE,
+        k_scales_row_stride: int = 1,
     ):
         self.persistent_ctas = int(persistent_ctas)
         self.num_heads_static = int(num_heads_static)
@@ -773,6 +834,11 @@ class SparseNSAPagedLogitsKernel:
         self.tile_block_q = int(tile_block_q)
         self.tile_block_k = int(tile_block_k)
         self.score_mode = int(score_mode)
+        self.qk_int8 = bool(qk_int8)
+        self.k_quant_page_stride = int(k_quant_page_stride)
+        self.k_quant_row_stride = int(k_quant_row_stride)
+        self.k_scales_page_stride = int(k_scales_page_stride)
+        self.k_scales_row_stride = int(k_scales_row_stride)
         if self.tiled_output and self.tile_block_k != _PAGED_TILED_BLOCK_K:
             raise ValueError(
                 f"paged tiled logits currently require block_k={_PAGED_TILED_BLOCK_K}, "
@@ -985,8 +1051,10 @@ class SparseNSAPagedLogitsKernel:
                             _load_index_k_page_scalar(
                                 k_quant_bytes,
                                 page_id,
-                                s_k_page_stage,
+                                k_page_base_addr,
                                 tx,
+                                self.k_quant_page_stride,
+                                self.k_quant_row_stride,
                             )
                         else:
                             if warp_idx == Int32(0):
@@ -999,7 +1067,12 @@ class SparseNSAPagedLogitsKernel:
                                 )
                         scale_idx = tx
                         while scale_idx < Int32(_PAGE_SIZE):
-                            s_scale[scale_idx] = Float32(k_scales[page_id, scale_idx])
+                            scale_offset = Int64(page_id) * Int64(
+                                self.k_scales_page_stride
+                            ) + Int64(scale_idx) * Int64(self.k_scales_row_stride)
+                            s_scale[scale_idx] = ld_global_nc_f32(
+                                get_ptr_as_int64(k_scales, scale_offset)
+                            )
                             scale_idx += Int32(_PAGED_THREADS_PER_CTA)
                         if use_scalar_k_load_flag == Int32(0):
                             cute.arch.mbarrier_wait(
@@ -1049,6 +1122,7 @@ class SparseNSAPagedLogitsKernel:
                                     token_group * Int32(_PAGED_TOKENS_PER_GROUP),
                                     head_tile_slot,
                                     self.score_mode,
+                                    self.qk_int8,
                                 )
                             cute.arch.sync_threads()
                             if (head_tile_slot == Int32(0)) & (
@@ -1980,9 +2054,21 @@ def _build_sparse_nsa_paged_kernel(
     persistent_ctas: int,
     num_heads_static: int,
     score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
+    qk_int8: bool = False,
+    k_quant_page_stride: int = _PAGE_SIZE * _INDEX_HEAD_DIM,
+    k_quant_row_stride: int = _INDEX_HEAD_DIM,
+    k_scales_page_stride: int = _PAGE_SIZE,
+    k_scales_row_stride: int = 1,
 ) -> SparseNSAPagedLogitsKernel:
     return SparseNSAPagedLogitsKernel(
-        persistent_ctas, num_heads_static, score_mode=score_mode
+        persistent_ctas,
+        num_heads_static,
+        score_mode=score_mode,
+        qk_int8=qk_int8,
+        k_quant_page_stride=k_quant_page_stride,
+        k_quant_row_stride=k_quant_row_stride,
+        k_scales_page_stride=k_scales_page_stride,
+        k_scales_row_stride=k_scales_row_stride,
     )
 
 
@@ -2059,6 +2145,21 @@ def _split_index_k_cache_runtime_views(
         raise ValueError(
             f"index_k_cache must have a contiguous last dimension, got stride={index_k_cache.stride()}"
         )
+    if index_k_cache.ndim == 4:
+        if tuple(index_k_cache.shape[1:]) != (
+            _PAGE_SIZE,
+            1,
+            _INDEX_HEAD_DIM + _SCALE_BYTES,
+        ):
+            raise ValueError(
+                "interleaved index_k_cache must have shape "
+                f"[pages, {_PAGE_SIZE}, 1, {_INDEX_HEAD_DIM + _SCALE_BYTES}], "
+                f"got {tuple(index_k_cache.shape)}"
+            )
+        token_rows = index_k_cache[:, :, 0, :]
+        k_quant_bytes = token_rows[:, :, :_INDEX_HEAD_DIM]
+        k_scales = token_rows[:, :, _INDEX_HEAD_DIM:].view(torch.float32).squeeze(-1)
+        return k_quant_bytes, k_scales
     num_pages = index_k_cache.shape[0]
     data_bytes = _PAGE_SIZE * _INDEX_HEAD_DIM
     k_quant_bytes = index_k_cache[:, :data_bytes].view(
@@ -2114,11 +2215,17 @@ def supports_paged_logits_kernel(
         return False
     if seqlens_per_query.ndim != 1 or seqlens_per_query.shape[0] != q_fp8.shape[0]:
         return False
-    if index_k_cache.ndim != 2 or index_k_cache.shape[1] != _PAGE_SIZE * (
+    planar_cache = index_k_cache.ndim == 2 and index_k_cache.shape[1] == _PAGE_SIZE * (
         _INDEX_HEAD_DIM + _SCALE_BYTES
-    ):
+    )
+    interleaved_cache = index_k_cache.ndim == 4 and tuple(index_k_cache.shape[1:]) == (
+        _PAGE_SIZE,
+        1,
+        _INDEX_HEAD_DIM + _SCALE_BYTES,
+    )
+    if not (planar_cache or interleaved_cache):
         return False
-    if q_fp8.dtype != torch.float8_e4m3fn:
+    if q_fp8.dtype not in (torch.float8_e4m3fn, torch.int8):
         return False
     if weights.dtype != torch.float32:
         return False
@@ -2126,9 +2233,9 @@ def supports_paged_logits_kernel(
         return False
     if index_k_cache.stride(-1) != 1:
         return False
-    if real_page_table.dtype != torch.int32 or seqlens_per_query.dtype != torch.int32:
-        return False
-    return True
+    return (
+        real_page_table.dtype == torch.int32 and seqlens_per_query.dtype == torch.int32
+    )
 
 
 def run_paged_logits_kernel(
@@ -2234,7 +2341,8 @@ def run_paged_logits_kernel(
         page_size=page_size,
     ):
         raise ValueError(
-            "sparse NSA paged logits kernel only supports the exact CUDA page_size=64 FP8 contract"
+            "sparse NSA paged logits kernel only supports the exact CUDA "
+            "page_size=64 FP8/INT8 contract"
         )
 
     rows = q_fp8.shape[0]
@@ -2280,6 +2388,7 @@ def run_paged_logits_kernel(
         device_index,
     )
     q_bytes = q_fp8.contiguous().view(torch.uint8)
+    qk_int8 = q_fp8.dtype == torch.int8
     weights_kernel = weights.contiguous()
     real_page_table_kernel = real_page_table.contiguous()
     seqlens_per_query_kernel = seqlens_per_query.contiguous()
@@ -2391,7 +2500,9 @@ def run_paged_logits_kernel(
             if schedule_metadata.is_contiguous()
             else schedule_metadata.contiguous()
         )
-    if _should_use_schedule_single_row_kernel(q_rows=rows, max_pages=max_pages):
+    if not qk_int8 and _should_use_schedule_single_row_kernel(
+        q_rows=rows, max_pages=max_pages
+    ):
         if schedule_metadata is None:
             raise ValueError(
                 "schedule_metadata is required for the scheduled single-row decode path"
@@ -2419,7 +2530,9 @@ def run_paged_logits_kernel(
                 dynamic_dims=(0,),
             ),
         )
-    elif _should_use_schedule_multi_row_kernel(q_rows=rows, max_pages=max_pages):
+    elif not qk_int8 and _should_use_schedule_multi_row_kernel(
+        q_rows=rows, max_pages=max_pages
+    ):
         if schedule_metadata is None:
             raise ValueError(
                 "schedule_metadata is required for the scheduled multi-row decode path"
@@ -2460,6 +2573,11 @@ def run_paged_logits_kernel(
             persistent_ctas,
             q_fp8.shape[1],
             score_mode,
+            qk_int8,
+            int(k_quant_bytes.stride(0)),
+            int(k_quant_bytes.stride(1)),
+            int(k_scales.stride(0)),
+            int(k_scales.stride(1)),
         )
         args = (
             *common_args,
@@ -2470,6 +2588,11 @@ def run_paged_logits_kernel(
         cache_key = (
             "persistent",
             persistent_ctas,
+            qk_int8,
+            int(k_quant_bytes.stride(0)),
+            int(k_quant_bytes.stride(1)),
+            int(k_scales.stride(0)),
+            int(k_scales.stride(1)),
             *common_cache_key,
         )
     compile_spec = KernelCompileSpec.from_key(

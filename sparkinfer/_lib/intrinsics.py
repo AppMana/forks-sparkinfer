@@ -3280,6 +3280,58 @@ def bf16_mma_m16n16k16_f32(
 
 
 @dsl_user_op
+def imma_m16n8k32_s32_s8(
+    d0: Int32,
+    d1: Int32,
+    d2: Int32,
+    d3: Int32,
+    a0: Uint32,
+    a1: Uint32,
+    a2: Uint32,
+    a3: Uint32,
+    b0: Uint32,
+    b1: Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Int32, Int32, Int32, Int32]:
+    """Warp MMA helper for signed INT8 `m16n8k32` with S32 accumulation."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [
+            Uint32(a0).ir_value(loc=loc, ip=ip),
+            Uint32(a1).ir_value(loc=loc, ip=ip),
+            Uint32(a2).ir_value(loc=loc, ip=ip),
+            Uint32(a3).ir_value(loc=loc, ip=ip),
+            Uint32(b0).ir_value(loc=loc, ip=ip),
+            Uint32(b1).ir_value(loc=loc, ip=ip),
+            Int32(d0).ir_value(loc=loc, ip=ip),
+            Int32(d1).ir_value(loc=loc, ip=ip),
+            Int32(d2).ir_value(loc=loc, ip=ip),
+            Int32(d3).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32
+        {$0, $1, $2, $3},
+        {$4, $5, $6, $7},
+        {$8, $9},
+        {$0, $1, $2, $3};
+        """,
+        "=r,=r,=r,=r,r,r,r,r,r,r,0,1,2,3",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    r0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    r1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    r2 = llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)
+    r3 = llvm.extractvalue(T.i32(), result, [3], loc=loc, ip=ip)
+    return Int32(r0), Int32(r1), Int32(r2), Int32(r3)
+
+
+@dsl_user_op
 def mxfp8_mma_m16n8k32_f32_e4m3(
     d0: Float32,
     d1: Float32,
