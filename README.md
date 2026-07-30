@@ -4,11 +4,12 @@
 LLM inference. It specifically targets DGX Spark, RTX Spark and the
 Blackwell-based RTX cards (RTX 6000 Pro, RTX 5090).
 
-The Hilton DeepSeek-V4 INT4/INT8 LeaderWorkerSet currently runs an older image
-that does **not** contain the downstream vLLM shared-mHC adapter. Its C1 15k and
-clean C2 1k acceptance arms ended in two-rank Xid 31 faults, so those failures
-are evidence about that older TileLang-mHC rollout, not evidence for or against
-the offline SparkInfer adapter described below.
+The accepted Hilton DeepSeek-V4 INT4/INT8 PP2 lane uses FlashMLA, Marlin, the
+Triton INT8 indexer and Triton mHC—not SparkInfer. With vLLM `5b0285ecd3`
+overlaid by checked init container at GitOps `101c036`, its clean actual
+1,110-/8,829-/43,084-token C1/C2 matrix completed 6/6 cells with zero pod
+restarts and no CUDA, Xid, or illegal-address log. That acceptance is bounded
+to `--max-model-len 65536`; it does not validate 250K context or this library.
 
 It is *not* intended to be used in production/datacenter environments, both due to
 architecture mismatches and the fast-moving pace of the library. For mission-critical
@@ -178,10 +179,13 @@ scales; it passes offline regression tests but still awaits end-to-end
 hardware validation. Do not treat either result as model-level validation of
 the SparkInfer NVFP4 path.
 
-Hilton's working `appmana/deepseek-v4-int4-int8` lane is a useful control but
-its proven core selects native FlashMLA over an `int8_ds_mla` cache and Marlin
-INT4 experts. That correctness does not validate this library's NVFP4
-integration or `norm.mhc`.
+Hilton's accepted `appmana/deepseek-v4-int4-int8` PP2 lane is a useful control,
+but its proven core selects native FlashMLA over an `int8_ds_mla` cache, the
+Triton INT8 indexer, Marlin INT4 experts and Triton mHC. A native SparkInfer
+INT8 indexer prototype exists only as uncommitted local changes in this and
+the vLLM worktree; it has not executed on GB10. The accepted matrix therefore
+does not validate that prototype, this library's NVFP4 integration, or
+`norm.mhc`. TileLang mHC is a separate downstream implementation concern.
 
 Downstream vLLM commit `75b9aff02c` adds a narrow GB12x adapter for
 `norm.mhc`: first-layer 2D broadcast plus fused norm, inter-layer fused
