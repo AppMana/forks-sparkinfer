@@ -153,6 +153,27 @@ def _contiguous_tensors():
     return q_fp8, weights, k_quant, k_scale, k_start, k_end, tile_logits
 
 
+def test_split_interleaved_int8_cache_preserves_live_strides_and_values() -> None:
+    cache = torch.empty_strided(
+        (3, 64, 1, 132),
+        (438_784, 132, 132, 1),
+        dtype=torch.uint8,
+    )
+    cache[:, :, 0, :128].view(torch.int8).fill_(-7)
+    cache[:, :, 0, 128:].view(torch.float32).fill_(0.03125)
+
+    k_quant, k_scales = paged_kernel._split_index_k_cache_runtime_views(cache)
+
+    assert k_quant.shape == (3, 64, 128)
+    assert k_quant.stride() == (438_784, 132, 1)
+    assert k_scales.shape == (3, 64)
+    assert k_scales.stride() == (109_696, 33)
+    k_quant_int8 = k_quant.view(torch.int8)
+    assert torch.equal(k_quant_int8, torch.full_like(k_quant_int8, -7))
+    assert torch.equal(k_scales, torch.full_like(k_scales, 0.03125))
+    assert paged_kernel._needs_paged_index_k_scalar_load(cache, k_quant)
+
+
 def test_paged_logits_kernel_binding_run_uses_binding_argument(monkeypatch) -> None:
     (
         q_fp8,
