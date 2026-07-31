@@ -6,6 +6,9 @@ import pytest
 import torch
 
 from sparkinfer.attention.nsa_indexer.kernel import run_paged_logits_kernel
+from sparkinfer.attention.nsa_indexer.contiguous_kernel import (
+    run_contiguous_logits_kernel,
+)
 
 
 _PAGE_SIZE = 64
@@ -97,3 +100,92 @@ def test_int8_interleaved_vllm_contract_and_high_page_addressing() -> None:
         rtol=2e-4,
     )
     assert torch.isneginf(logits[0, _LIVE_CONTEXT:]).all()
+
+
+def _contiguous_eager_reference(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    k: torch.Tensor,
+    scales: torch.Tensor,
+    k_start: torch.Tensor,
+    k_end: torch.Tensor,
+) -> torch.Tensor:
+    dots = torch.einsum("mhd,nd->mhn", q.to(torch.float32), k.to(torch.float32))
+    logits = (dots.relu() * weights[:, :, None]).sum(dim=1)
+    logits *= scales[None, :]
+    cols = torch.arange(k.shape[0], device=q.device)
+    valid = (cols[None, :] >= k_start[:, None]) & (cols[None, :] < k_end[:, None])
+    return logits.masked_fill(~valid, float("-inf"))
+
+
+def test_int8_contiguous_prefill_matches_eager_oracle() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(1234)
+    q = torch.randint(
+        -17,
+        18,
+        (33, _HEADS, _HEAD_DIM),
+        dtype=torch.int8,
+        device="cuda",
+        generator=generator,
+    )
+    k = torch.randint(
+        -19,
+        20,
+        (321, _HEAD_DIM),
+        dtype=torch.int8,
+        device="cuda",
+        generator=generator,
+    )
+    weights = torch.randn(
+        (33, _HEADS), dtype=torch.float32, device="cuda", generator=generator
+    )
+    scales = (
+        torch.rand((321,), dtype=torch.float32, device="cuda", generator=generator)
+        * 0.03
+    )
+    k_start = torch.arange(33, dtype=torch.int32, device="cuda") % 29
+    k_end = 321 - (torch.arange(33, dtype=torch.int32, device="cuda") % 31)
+
+    actual = run_contiguous_logits_kernel(
+        q_fp8=q,
+        weights=weights,
+        k_quant=k,
+        k_scale=scales,
+        k_start=k_start,
+        k_end=k_end,
+    )
+    expected = _contiguous_eager_reference(q, weights, k, scales, k_start, k_end)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=3e-5)
+
+
+@pytest.mark.parametrize("rows,context", [(8_192, 2_048), (1_024, 16_384)])
+def test_int8_contiguous_prefill_target_shapes(rows: int, context: int) -> None:
+    q = torch.full((rows, _HEADS, _HEAD_DIM), -1, dtype=torch.int8, device="cuda")
+    k = torch.full((context, _HEAD_DIM), -1, dtype=torch.int8, device="cuda")
+    weights = torch.full(
+        (rows, _HEADS), 1.0 / _HEADS, dtype=torch.float32, device="cuda"
+    )
+    scales = torch.linspace(0.005, 0.02, context, dtype=torch.float32, device="cuda")
+    k_start = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    k_end = torch.full((rows,), context, dtype=torch.int32, device="cuda")
+
+    actual = run_contiguous_logits_kernel(
+        q_fp8=q,
+        weights=weights,
+        k_quant=k,
+        k_scale=scales,
+        k_start=k_start,
+        k_end=k_end,
+        preinitialize_invalid_logits=False,
+    )
+    expected_row = _HEAD_DIM * scales
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        actual,
+        expected_row.expand(rows, context),
+        atol=2e-4,
+        rtol=2e-4,
+    )
