@@ -318,6 +318,75 @@ def test_silu_single_token_multi_expert_dynamic_direct_matches_reference() -> No
     assert metrics.cos > 0.9999, f"silu/direct: {metrics}"
 
 
+def test_dynamic_nvfp4_ignores_negative_padding_routes() -> None:
+    """vLLM marks padded routes with expert -1 and router weight zero."""
+    device = require_sparkinfer()
+    (
+        x,
+        topk_ids,
+        topk_weights,
+        w1_fp4,
+        w1_blockscale,
+        w1_alphas,
+        w2_fp4,
+        w2_blockscale,
+        w2_alphas,
+        a1_gscale,
+        a2_gscale,
+        experts_count,
+        k,
+        n,
+    ) = _make_activation_case(device=device, activation="silu", m=128)
+    topk_ids[64:] = -1
+    topk_weights[64:] = 0.0
+
+    reference = moe_reference_nvfp4(
+        x,
+        w1_fp4,
+        w1_blockscale,
+        w1_alphas,
+        w2_fp4,
+        w2_blockscale,
+        w2_alphas,
+        a1_gscale,
+        a2_gscale,
+        topk_ids.clamp_min(0),
+        topk_weights,
+        experts_count,
+        k,
+        n,
+        activation="silu",
+    )
+    experts = prepare_tp_moe_fp4_experts(
+        a=x,
+        a1_gscale=a1_gscale,
+        w1_fp4=w1_fp4,
+        w1_blockscale=w1_blockscale,
+        w1_alphas=w1_alphas,
+        a2_gscale=a2_gscale,
+        w2_fp4=w2_fp4,
+        w2_blockscale=w2_blockscale,
+        w2_alphas=w2_alphas,
+        activation="silu",
+    )
+
+    clear_tp_moe_caches()
+    output = run_tp_moe_fp4(
+        a=x,
+        experts=experts,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        input_scales_static=True,
+        fast_math=False,
+    )
+    torch.cuda.synchronize(device)
+
+    assert torch.count_nonzero(output[64:]).item() == 0
+    metrics = compare_to_reference(output, reference)
+    assert metrics.max_abs == 0.0, metrics
+    assert metrics.rmse == 0.0, metrics
+
+
 def test_dynamic_deterministic_multislice_matches_atomic_and_repeats(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

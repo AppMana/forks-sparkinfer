@@ -2647,6 +2647,10 @@ class MoEDynamicKernelBackend:
             hist_idx = flat_tid
             while hist_idx < total_pairs:
                 expert_id = topk_ids[hist_idx].to(Int32)
+                if expert_id < Int32(0):
+                    expert_id = Int32(0)
+                if expert_id >= num_experts:
+                    expert_id = Int32(0)
                 atomic_add_global_i32(get_ptr_as_int64(row_counts, expert_id), Int32(1))
                 hist_idx += flat_stride
 
@@ -2751,6 +2755,12 @@ class MoEDynamicKernelBackend:
                                 pair_idx = token_idx * num_topk + topk_slot
                                 expert_id = topk_ids[pair_idx].to(Int32)
                                 weight = topk_weights[pair_idx].to(cutlass.Float32)
+                                if expert_id < Int32(0):
+                                    expert_id = Int32(0)
+                                    weight = cutlass.Float32(0.0)
+                                if expert_id >= num_experts:
+                                    expert_id = Int32(0)
+                                    weight = cutlass.Float32(0.0)
                                 if cutlass.const_expr(self.direct_routing):
                                     row = Int32(0)
                                     phys_tile = pair_idx
@@ -3130,6 +3140,12 @@ class MoEDynamicKernelBackend:
                             expert_id = topk_ids[pair_idx].to(Int32)
                             token_idx = pair_idx // num_topk
                             weight = topk_weights[pair_idx].to(cutlass.Float32)
+                            if expert_id < Int32(0):
+                                expert_id = Int32(0)
+                                weight = cutlass.Float32(0.0)
+                            if expert_id >= num_experts:
+                                expert_id = Int32(0)
+                                weight = cutlass.Float32(0.0)
 
                             if lane_id == Int32(0):
                                 if cutlass.const_expr(self.direct_routing):
@@ -3320,6 +3336,10 @@ class MoEDynamicKernelBackend:
                     pair_flush = Int32(bidz)
                     while pair_flush < total_pairs:
                         expert_flush = topk_ids[pair_flush].to(Int32)
+                        if expert_flush < Int32(0):
+                            expert_flush = Int32(0)
+                        if expert_flush >= num_experts:
+                            expert_flush = Int32(0)
                         self._publish_deferred_tasks(
                             task_expert,
                             task_valid_rows,
