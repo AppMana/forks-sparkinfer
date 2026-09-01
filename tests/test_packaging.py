@@ -26,3 +26,19 @@ def test_runtime_cuda_sources_are_in_package_data() -> None:
     assert {
         path.name for path in (ROOT / "sparkinfer" / "comm" / "pcie").glob("*.cu")
     } == RUNTIME_CUDA_SOURCES
+
+
+def test_release_version_is_supplied_by_the_build() -> None:
+    config = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    assert "version" in config["project"]["dynamic"]
+    assert "version" not in config["project"]
+
+    setup_source = (ROOT / "setup.py").read_text()
+    assert 'os.getenv("SPARKINFER_VERSION", "1.0.1")' in setup_source
+
+
+def test_local_extension_builds_prefer_sccache() -> None:
+    setup_source = (ROOT / "setup.py").read_text()
+    assert 'shutil.which("sccache")' in setup_source
+    assert 'os.environ.setdefault("PYTORCH_NVCC"' in setup_source
+    assert "TORCH_EXTENSION_SKIP_NVCC_GEN_DEPENDENCIES" in setup_source

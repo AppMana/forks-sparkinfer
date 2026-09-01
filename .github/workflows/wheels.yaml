@@ -77,6 +77,8 @@ jobs:
     outputs:
       tag_name: ${{ steps.meta.outputs.tag_name }}
       release_name: ${{ steps.meta.outputs.release_name }}
+      package_version: ${{ steps.meta.outputs.package_version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
       - name: Compute tag and release name
         id: meta
@@ -85,11 +87,19 @@ jobs:
           set -euo pipefail
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             tag="${GITHUB_REF#refs/tags/}"
+            package_version="${tag#v}"
           else
-            tag="v1.0.1"
+            tag=""
+            package_version="1.0.2.dev${GITHUB_RUN_NUMBER}"
           fi
+          prerelease=false
+          case "$package_version" in
+            *dev*|*rc*|*alpha*|*beta*) prerelease=true ;;
+          esac
           echo "tag_name=${tag}" >> "$GITHUB_OUTPUT"
-          echo "release_name=sparkinfer ${tag}" >> "$GITHUB_OUTPUT"
+          echo "release_name=sparkinfer ${tag:-artifact}" >> "$GITHUB_OUTPUT"
+          echo "package_version=${package_version}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
 
 
   # ------------------------------------------------------- CuTe-DSL AOT cache
@@ -172,6 +182,8 @@ jobs:
       # declares in sparkinfer/_lib/meta.py:44. There is no PTX entry because
       # nothing here needs forward compatibility to an unlisted arch.
       SPARKINFER_ARCH_LIST: "8.6 12.0a 12.1a"
+      SPARKINFER_VERSION: ${{ needs.release-meta.outputs.package_version }}
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Free runner disk (the cuda13 manylinux builder is ~20GB)
         uses: jlumbroso/free-disk-space@main
@@ -185,6 +197,8 @@ jobs:
           swap-storage: false
 
       - uses: actions/checkout@v4
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Fetch the CuTe-DSL AOT caches captured on target hardware
         uses: actions/download-artifact@v4
@@ -212,7 +226,13 @@ jobs:
         run: |
           set -euo pipefail
           docker run --rm -v "$PWD":/io -w /io \
+            -v "$(realpath "$(command -v sccache)"):/usr/local/bin/sccache:ro" \
             -e TORCH_CUDA_ARCH_LIST="${SPARKINFER_ARCH_LIST}" \
+            -e SPARKINFER_VERSION \
+            -e SCCACHE_GHA_ENABLED \
+            -e ACTIONS_CACHE_URL \
+            -e ACTIONS_RUNTIME_TOKEN \
+            -e ACTIONS_RESULTS_URL \
             pytorch/manylinux2_28-builder:cuda13.0 bash -c '
             set -euo pipefail
             export PATH=/opt/python/'"${PYTHON_TAG}"'-'"${PYTHON_TAG}"'/bin:$PATH
@@ -228,7 +248,9 @@ jobs:
             # torch installed above rather than whatever variant PyPI would
             # resolve. Isolation itself is proven to work by the separate
             # smoke step below.
+            sccache --zero-stats
             MAX_JOBS=2 NVCC_THREADS=2 python setup.py bdist_wheel
+            sccache --show-stats
             uv pip install --system -q auditwheel
             auditwheel repair dist/*.whl --plat manylinux_2_28_x86_64 \
               --exclude "libtorch*.so*" --exclude "libc10*.so*" --exclude "libcudart*.so*" \
@@ -243,6 +265,12 @@ jobs:
         run: |
           set -euo pipefail
           docker run --rm -v "$PWD":/io -w /io \
+            -v "$(realpath "$(command -v sccache)"):/usr/local/bin/sccache:ro" \
+            -e SPARKINFER_VERSION \
+            -e SCCACHE_GHA_ENABLED \
+            -e ACTIONS_CACHE_URL \
+            -e ACTIONS_RUNTIME_TOKEN \
+            -e ACTIONS_RESULTS_URL \
             pytorch/manylinux2_28-builder:cuda13.0 bash -c '
             set -euo pipefail
             export PATH=/opt/python/'"${PYTHON_TAG}"'-'"${PYTHON_TAG}"'/bin:$PATH
@@ -366,6 +394,8 @@ jobs:
       # (sparkinfer/_lib/gating.py:29-32), and no aarch64 NVIDIA part ships
       # sm_86 or sm_120. That leaves exactly GB10.
       SPARKINFER_ARCH_LIST: "12.1a"
+      SPARKINFER_VERSION: ${{ needs.release-meta.outputs.package_version }}
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Free runner disk (the cuda13 manylinux builder is ~20GB)
         uses: jlumbroso/free-disk-space@main
@@ -379,6 +409,8 @@ jobs:
           swap-storage: false
 
       - uses: actions/checkout@v4
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Fetch the CuTe-DSL AOT caches captured on target hardware
         uses: actions/download-artifact@v4
@@ -406,7 +438,13 @@ jobs:
         run: |
           set -euo pipefail
           docker run --rm -v "$PWD":/io -w /io \
+            -v "$(realpath "$(command -v sccache)"):/usr/local/bin/sccache:ro" \
             -e TORCH_CUDA_ARCH_LIST="${SPARKINFER_ARCH_LIST}" \
+            -e SPARKINFER_VERSION \
+            -e SCCACHE_GHA_ENABLED \
+            -e ACTIONS_CACHE_URL \
+            -e ACTIONS_RUNTIME_TOKEN \
+            -e ACTIONS_RESULTS_URL \
             pytorch/manylinuxaarch64-builder:cuda13.0 bash -c '
             set -euo pipefail
             export PATH=/opt/python/'"${PYTHON_TAG}"'-'"${PYTHON_TAG}"'/bin:$PATH
@@ -417,7 +455,9 @@ jobs:
             rm -rf build dist dist_manylinux
             # The hosted arm64 runner is 4 cores / 16 GB. Serialize nvcc;
             # wall-clock matters less than finishing.
+            sccache --zero-stats
             MAX_JOBS=1 NVCC_THREADS=1 python setup.py bdist_wheel
+            sccache --show-stats
             uv pip install --system -q auditwheel
             auditwheel repair dist/*.whl --plat manylinux_2_28_aarch64 \
               --exclude "libtorch*.so*" --exclude "libc10*.so*" --exclude "libcudart*.so*" \
@@ -505,7 +545,7 @@ jobs:
     name: Publish release
     runs-on: ubuntu-24.04
     needs: [release-meta, manylinux-wheel, manylinux-wheel-aarch64]
-    if: ${{ !cancelled() && needs.manylinux-wheel.result == 'success' }}
+    if: ${{ startsWith(github.ref, 'refs/tags/') && !cancelled() && needs.manylinux-wheel.result == 'success' }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -519,7 +559,7 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: ${{ needs.release-meta.outputs.release_name }}
           draft: false
-          prerelease: false
+          prerelease: ${{ needs.release-meta.outputs.prerelease == 'true' }}
           files: release-artifacts/*.whl
           fail_on_unmatched_files: true
           make_latest: true
@@ -534,7 +574,7 @@ jobs:
     name: Publish gh-pages PEP 503 simple index
     runs-on: ubuntu-24.04
     needs: [release-meta, manylinux-wheel, manylinux-wheel-aarch64, publish-release]
-    if: ${{ !cancelled() && needs.publish-release.result == 'success' }}
+    if: ${{ startsWith(github.ref, 'refs/tags/') && !cancelled() && needs.publish-release.result == 'success' }}
     steps:
       - uses: actions/download-artifact@v4
         with:

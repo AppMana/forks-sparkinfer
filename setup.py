@@ -29,9 +29,30 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 
 from setuptools import setup
+
+
+def _enable_sccache() -> None:
+    """Use sccache automatically for local CUDA extension builds when present."""
+    if os.getenv("SPARKINFER_DISABLE_SCCACHE", "0") == "1":
+        return
+    sccache = shutil.which("sccache")
+    if not sccache:
+        return
+
+    cxx = os.environ.get("CXX") or shutil.which("g++") or "c++"
+    cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
+    nvcc = str(Path(cuda_home) / "bin" / "nvcc")
+    os.environ.setdefault("CXX", f"{sccache} {cxx}")
+    if Path(nvcc).exists():
+        os.environ.setdefault("PYTORCH_NVCC", f"{sccache} {nvcc}")
+        os.environ.setdefault("TORCH_EXTENSION_SKIP_NVCC_GEN_DEPENDENCIES", "1")
+
+
+_enable_sccache()
 
 _PACKAGE = Path("sparkinfer")
 _PCIE = _PACKAGE / "comm" / "pcie"
@@ -107,4 +128,4 @@ def _build_kwargs() -> dict:
     }
 
 
-setup(**_build_kwargs())
+setup(version=os.getenv("SPARKINFER_VERSION", "1.0.1"), **_build_kwargs())
