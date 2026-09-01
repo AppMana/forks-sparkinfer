@@ -42,3 +42,22 @@ def test_local_extension_builds_prefer_sccache() -> None:
     assert 'shutil.which("sccache")' in setup_source
     assert 'os.environ.setdefault("PYTORCH_NVCC"' in setup_source
     assert "TORCH_EXTENSION_SKIP_NVCC_GEN_DEPENDENCIES" in setup_source
+
+
+def test_isolated_build_guard_does_not_compile_the_extensions_twice() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "wheels.yaml").read_text()
+    smoke = workflow.split(
+        "- name: Smoke test the isolated PEP 517 build", 1
+    )[1].split("- name: Assert the wheel is AOT", 1)[0]
+
+    assert "python -m build --sdist" in smoke
+    assert "python -m build --wheel" not in smoke
+    assert '"extensions_built"' in smoke
+
+
+def test_container_wheels_use_a_restorable_local_sccache() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "wheels.yaml").read_text()
+
+    assert workflow.count("uses: actions/cache@v4") >= 2
+    assert workflow.count('-e SCCACHE_DIR=/sccache-cache') >= 2
+    assert workflow.count('${RUNNER_TEMP}/sccache:/sccache-cache') >= 2

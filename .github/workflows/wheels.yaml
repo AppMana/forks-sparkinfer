@@ -200,6 +200,14 @@ jobs:
 
       - uses: mozilla-actions/sccache-action@v0.0.9
 
+      - name: Restore the container compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sparkinfer-sccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('setup.py', 'sparkinfer/comm/pcie/*.cu') }}
+          restore-keys: |
+            sparkinfer-sccache-v1-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Fetch the CuTe-DSL AOT caches captured on target hardware
         uses: actions/download-artifact@v4
         continue-on-error: true
@@ -227,12 +235,10 @@ jobs:
           set -euo pipefail
           docker run --rm -v "$PWD":/io -w /io \
             -v "$(realpath "$(command -v sccache)"):/usr/local/bin/sccache:ro" \
+            -v "${RUNNER_TEMP}/sccache:/sccache-cache" \
             -e TORCH_CUDA_ARCH_LIST="${SPARKINFER_ARCH_LIST}" \
             -e SPARKINFER_VERSION \
-            -e SCCACHE_GHA_ENABLED \
-            -e ACTIONS_CACHE_URL \
-            -e ACTIONS_RUNTIME_TOKEN \
-            -e ACTIONS_RESULTS_URL \
+            -e SCCACHE_DIR=/sccache-cache \
             pytorch/manylinux2_28-builder:cuda13.0 bash -c '
             set -euo pipefail
             export PATH=/opt/python/'"${PYTHON_TAG}"'-'"${PYTHON_TAG}"'/bin:$PATH
@@ -265,44 +271,39 @@ jobs:
         run: |
           set -euo pipefail
           docker run --rm -v "$PWD":/io -w /io \
-            -v "$(realpath "$(command -v sccache)"):/usr/local/bin/sccache:ro" \
             -e SPARKINFER_VERSION \
-            -e SCCACHE_GHA_ENABLED \
-            -e ACTIONS_CACHE_URL \
-            -e ACTIONS_RUNTIME_TOKEN \
-            -e ACTIONS_RESULTS_URL \
             pytorch/manylinux2_28-builder:cuda13.0 bash -c '
             set -euo pipefail
             export PATH=/opt/python/'"${PYTHON_TAG}"'-'"${PYTHON_TAG}"'/bin:$PATH
-            export LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LIBRARY_PATH:-}"
-            export TORCH_CUDA_ARCH_LIST="8.6"
             python -m pip install -q -U pip build
             rm -rf build dist_isolated
             # Deliberately isolated and deliberately NOT preinstalling torch:
-            # this is the whole test. If torch ever falls out of
-            # build-system.requires, setup.py silently emits a pure-Python
-            # wheel and this step is the only thing that notices.
-            MAX_JOBS=2 NVCC_THREADS=2 python -m build --wheel --outdir dist_isolated
+            # this is the whole test. Building an sdist still executes setup.py
+            # and records whether its isolated environment found torch, without
+            # compiling the same CUDA extensions for a second time.
+            python -m build --sdist --outdir dist_isolated
           '
           sudo chown -R "$(id -u):$(id -g)" dist_isolated 2>/dev/null || true
           python3 - <<'PY'
-          import glob, sys, zipfile
-          wheels = glob.glob("dist_isolated/*.whl")
-          assert len(wheels) == 1, f"expected one wheel, got {wheels}"
-          names = zipfile.ZipFile(wheels[0]).namelist()
-          missing = [
-              w for w in ("dma", "oneshot", "twoshot", "dcp_a2a")
-              if not any(n.startswith(f"sparkinfer_pcie_{w}_ext") and n.endswith(".so")
-                         for n in names)
-          ]
-          if missing:
-              sys.exit(
-                  "an isolated `python -m build` produced a pure-Python wheel: no "
-                  f"sparkinfer_pcie_{{{','.join(missing)}}}_ext*.so. torch is missing "
-                  "from build-system.requires in pyproject.toml, or setup.py no "
-                  "longer reaches its CUDAExtension path."
-              )
-          print(f"ok: isolated build carries the extensions ({wheels[0]})")
+          import glob, json, tarfile
+
+          sdists = glob.glob("dist_isolated/*.tar.gz")
+          assert len(sdists) == 1, f"expected one sdist, got {sdists}"
+          with tarfile.open(sdists[0], "r:gz") as archive:
+              matches = [
+                  member for member in archive.getmembers()
+                  if member.name.endswith("/sparkinfer/_build_info.json")
+              ]
+              assert len(matches) == 1, "isolated sdist omitted _build_info.json"
+              stream = archive.extractfile(matches[0])
+              assert stream is not None
+              info = json.load(stream)
+          assert info["extensions_built"] is True, (
+              "isolated setup did not reach CUDAExtension; torch is probably "
+              "missing from build-system.requires"
+          )
+          assert info["torch_version"], "isolated setup did not import torch"
+          print(f"ok: isolated setup selected CUDA extensions ({sdists[0]})")
           PY
 
       - name: Assert the wheel is AOT (extensions, DSL objects, build binding)
@@ -412,6 +413,14 @@ jobs:
 
       - uses: mozilla-actions/sccache-action@v0.0.9
 
+      - name: Restore the container compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sparkinfer-sccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('setup.py', 'sparkinfer/comm/pcie/*.cu') }}
+          restore-keys: |
+            sparkinfer-sccache-v1-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Fetch the CuTe-DSL AOT caches captured on target hardware
         uses: actions/download-artifact@v4
         continue-on-error: true
@@ -439,12 +448,10 @@ jobs:
           set -euo pipefail
           docker run --rm -v "$PWD":/io -w /io \
             -v "$(realpath "$(command -v sccache)"):/usr/local/bin/sccache:ro" \
+            -v "${RUNNER_TEMP}/sccache:/sccache-cache" \
             -e TORCH_CUDA_ARCH_LIST="${SPARKINFER_ARCH_LIST}" \
             -e SPARKINFER_VERSION \
-            -e SCCACHE_GHA_ENABLED \
-            -e ACTIONS_CACHE_URL \
-            -e ACTIONS_RUNTIME_TOKEN \
-            -e ACTIONS_RESULTS_URL \
+            -e SCCACHE_DIR=/sccache-cache \
             pytorch/manylinuxaarch64-builder:cuda13.0 bash -c '
             set -euo pipefail
             export PATH=/opt/python/'"${PYTHON_TAG}"'-'"${PYTHON_TAG}"'/bin:$PATH
