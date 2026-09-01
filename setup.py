@@ -43,10 +43,8 @@ def _enable_sccache() -> None:
     if not sccache:
         return
 
-    cxx = os.environ.get("CXX") or shutil.which("g++") or "c++"
     cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
     nvcc = str(Path(cuda_home) / "bin" / "nvcc")
-    os.environ.setdefault("CXX", f"{sccache} {cxx}")
     if Path(nvcc).exists():
         os.environ.setdefault("PYTORCH_NVCC", f"{sccache} {nvcc}")
         os.environ.setdefault("TORCH_EXTENSION_SKIP_NVCC_GEN_DEPENDENCIES", "1")
