@@ -163,3 +163,26 @@ def test_packed_search_excludes_candidates_over_workspace_capacity(workspace_for
         for split in splits
         if split > 1
     ) == 1_811_939_328
+
+
+@pytest.mark.parametrize("recipe,tile_m", [("q6_k", 64), ("q8_0", 32)])
+def test_gguf_prefill_default_preserves_short_rows_and_explicit_overrides(recipe, tile_m):
+    from b12x.preparation import DeviceIdentity
+    from b12x.gemm.blockscaled._tuning import BlockscaledQuery, BlockscaledConfig, TUNING
+    device = DeviceIdentity("nvidia", (12, 1), 48, "NVIDIA GB10")
+    query = BlockscaledQuery(recipe=recipe, num_tokens=512, in_features=1280,
+                             padded_in_features=1280, out_features=1024)
+    expected = BlockscaledConfig(mode="a16", tile_m=tile_m, tile_n=64,
+                                  tile_k=64, split_k=1, short_rows=True)
+    assert TUNING.configure(query, device=device).default == expected
+    assert BlockscaledConfig.from_config(expected.to_dict()) == expected
+    for rows in (9, 127):
+        assert TUNING.configure(replace(query, num_tokens=rows), device=device).default == (
+            BlockscaledConfig(mode="a16", tile_n=64, tile_k=64, split_k=1)
+        )
+    unknown = replace(device, product_name="unqualified SM121")
+    assert TUNING.configure(query, device=unknown).default.tile_m is None
+    pinned = replace(expected, short_rows=False)
+    assert TUNING.configure(query, device=device, override=pinned).default == pinned
+    with pytest.raises(ValueError, match="short_rows"):
+        TUNING.configure(query, device=device, override=replace(expected, split_k=2))

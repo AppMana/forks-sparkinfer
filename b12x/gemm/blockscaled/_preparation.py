@@ -89,6 +89,16 @@ def compile_packed(query_payload, config_payload, dense_payload, short_dense_pay
                 input_k=query.in_features, device_ordinal=ordinal,
             )
             programs = {"gemm": gemm}
+            if config.short_rows:
+                # Retain the previous capacity-plan schedule for rows <128.
+                # Both programs are resolved now; live rows never compile.
+                short_config = replace(
+                    config, tile_m=16, tile_n=64, tile_k=64, short_rows=False,
+                )
+                programs["short_gemm"] = compile_packed(
+                    query_payload, short_config.to_dict(), None, None,
+                    ordinal, sm_count, capability,
+                )["gemm"]
             if slices > 1:
                 programs["reduce"] = _reduce.compile_reduce(query.out_features, slices, ordinal)
             return programs
@@ -266,7 +276,8 @@ class _PackedExecutionState:
                 import cutlass.cute as cute
                 _, _, slices = effective_a16_config(q, config)
                 target = out if slices == 1 else workspace[:self.required_workspace].view(torch.float32)
-                self.programs["gemm"](
+                program = self.programs["short_gemm" if config.short_rows and m < 128 else "gemm"]
+                program(
                     source.view(m, q.in_features), values, self.iq2_lut if iq2 and q.recipe not in ("q8_0", "q6_k") else scale_bytes, scale_bytes, target,
                     global_scale if fp4 else self.alpha_one, cuda_stream_to_int(stream),
                 )

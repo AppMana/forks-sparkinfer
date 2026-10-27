@@ -39,11 +39,12 @@ class BlockscaledConfig:
     tile_n: int | None = None
     tile_k: int | None = None
     split_k: int | None = None
+    short_rows: bool = False
 
     @classmethod
     def from_config(cls, payload):
-        if set(payload) != {"mode", "tile_m", "tile_n", "tile_k", "split_k"}:
-            raise ValueError("packed precision config requires mode and four nullable A16 knobs")
+        if set(payload) != {"mode", "tile_m", "tile_n", "tile_k", "split_k", "short_rows"}:
+            raise ValueError("packed precision config requires mode, four A16 knobs, and short_rows")
         return cls(**dict(payload))
 
     def to_dict(self):
@@ -99,6 +100,17 @@ def _default_config(query, device):
         return BlockscaledConfig(mode="quantized")
     if _automatic_a16(query, device):
         return BlockscaledConfig(mode="a16", tile_n=128, tile_k=128 if query.recipe == "iq2_xxs" else 64, split_k=4)
+    if (query.recipe in ("q6_k", "q8_0") and query.num_tokens >= 128
+            and query.in_features >= 1280 and query.out_features >= 1024
+            and device is not None and device.compute_capability == (12, 1)
+            and device.sm_count == 48 and device.product_name == "nvidia gb10"):
+        # Actual GGUF prefill projections: larger M reuses inline decoding.
+        # K256 metadata reuse lost to K64 in the measured GB10 corpus.
+        return BlockscaledConfig(
+            mode="a16", tile_m=64 if query.recipe == "q6_k" else 32,
+            tile_n=64, tile_k=64, split_k=1,
+            short_rows=query.expected_m is None,
+        )
     if query.activation_mode == "a16" or query.recipe in ("iq2_xs", "iq3_xxs", "iq2_xxs", "q8_0", "q6_k"):
         return BlockscaledConfig(mode="a16", tile_n=64, tile_k=128 if query.recipe == "iq2_xxs" else 64, split_k=1)
     return BlockscaledConfig(mode="quantized")
@@ -116,6 +128,14 @@ def effective_a16_config(query, config):
 def _validate_config(query, config, device):
     if not isinstance(config, BlockscaledConfig) or config.mode not in ("a16", "quantized"):
         raise ValueError("invalid packed precision configuration")
+    if type(config.short_rows) is not bool:
+        raise TypeError("short_rows must be boolean")
+    if config.short_rows and not (
+        config.mode == "a16" and query.recipe in ("q6_k", "q8_0")
+        and config.split_k == 1 and query.num_tokens >= 128
+        and query.expected_m is None
+    ):
+        raise ValueError("short_rows requires dynamic Q6/Q8 A16 capacity >=128 without split-K")
     if query.activation_mode != "auto" and config.mode != query.activation_mode:
         raise ValueError("configuration conflicts with caller activation precision")
     if query.recipe in ("iq2_xs", "iq3_xxs", "iq2_xxs", "q8_0", "q6_k") and config.mode != "a16":
@@ -170,6 +190,12 @@ def _validate_config(query, config, device):
 def _tuning_parameters(query, device):
     del device
     def eligible(parameters):
+        if parameters["short_rows"] and not (
+            parameters["mode"] == "a16" and query.recipe in ("q6_k", "q8_0")
+            and parameters["split_k"] == 1 and query.num_tokens >= 128
+            and query.expected_m is None
+        ):
+            return False
         if parameters["mode"] != "a16":
             return True
         if parameters["tile_n"] == 4:
@@ -196,23 +222,24 @@ def _equivalence(query, device, config):
     if config.mode == "quantized":
         return {"mode": "quantized"}
     n, k, split = effective_a16_config(query, config)
-    return {"mode": "a16", "tile_m": config.tile_m or 16, "tile_n": n, "tile_k": k, "split_k": split}
+    return {"mode": "a16", "tile_m": config.tile_m or 16, "tile_n": n, "tile_k": k, "split_k": split, "short_rows": config.short_rows}
 
 
 TUNING = TuningContract(
-    component_id="gemm.blockscaled_precision", query_schema_version=9, config_schema_version=4,
+    component_id="gemm.blockscaled_precision", query_schema_version=9, config_schema_version=5,
     query_fields=frozenset(BlockscaledQuery.__dataclass_fields__),
     config_fields=frozenset(BlockscaledConfig.__dataclass_fields__),
     encode_query=lambda query: {name: getattr(query, name) for name in query.__dataclass_fields__},
     encode_config=BlockscaledConfig.to_dict, decode_config=BlockscaledConfig.from_config,
     validate_query=_validate_query, validate_config=_validate_config, default_config=_default_config,
-    candidate_contract_version=20,
+    candidate_contract_version=21,
     knobs=(
         Knob(name="mode", values=("a16", "quantized"), binding=ParameterBinding.COMPILE),
         Knob(name="tile_m", values=(1, 2, 4, 8, 16, 32, 64), when=FrozenMapping({"mode": "a16"})),
         Knob(name="tile_n", values=(4, 64, 128), when=FrozenMapping({"mode": "a16"})),
         Knob(name="tile_k", values=(64, 128, 256), when=FrozenMapping({"mode": "a16"})),
         Knob(name="split_k", values=(1, 2, 4, 8), when=FrozenMapping({"mode": "a16"})),
+        Knob(name="short_rows", values=(False, True)),
     ),
     parameters=_tuning_parameters,
     equivalence_key=_equivalence,
