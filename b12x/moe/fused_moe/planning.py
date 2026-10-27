@@ -12,13 +12,21 @@ from ._impl import (
     plan_b12x_fp4_moe_weights,
     prepare_b12x_fp4_moe_weights,
     prepare_b12x_trellis_v2_weights,
-    prepare_b12x_iq2_xs_weights,
+    prepare_b12x_iq_weights,
+    own_b12x_iq_weights,
 )
 from .config import TrellisConfig
 from .source import PackedSource, WeightSource
 from .weights import (
     PackedWeights,
     IQ2XSWeights,
+    IQ3XXSWeights,
+    IQ2XXSWeights,
+    IQ2SWeights,
+    IQ3SWeights,
+    IQMXFP4Weights,
+    IQMixedWeights,
+    GGUFExpertWeights,
     PreparedExperts,
     PreparedWeightFormat,
     ScaleEncoding,
@@ -179,7 +187,7 @@ def _prepared_format(
         scales = ScaleEncoding.TRELLIS_SCALES
     else:
         weights = (
-            WeightEncoding.IQ2_XS if source.format.value == "iq2_xs" else
+            WeightEncoding(source.format.value) if source.format.value in {"iq2_xs", "iq3_xxs", "iq2_xxs", "iq2_s", "iq3_s"} else
             WeightEncoding.FP6_E2M3
             if source.format.value == "mxfp6_e2m3"
             else WeightEncoding.FP4_E2M1
@@ -190,6 +198,9 @@ def _prepared_format(
         scales=scales,
         packing=packing,
         available_packings=available,
+        fc2_weights=(WeightEncoding.FP4_E2M1 if plan.fc2_format == "mxfp4" else WeightEncoding(plan.fc2_format)) if plan.fc2_format else None,
+        fc2_scales=(ScaleEncoding.E8M0_K32 if plan.fc2_format == "mxfp4" else ScaleEncoding(plan.fc2_format)) if plan.fc2_format else None,
+        fc2_packing=(WeightPacking.MMA_PACKED if plan.fc2_format == "mxfp4" else WeightPacking(plan.fc2_format + "_compact")) if plan.fc2_format else None,
     )
 
 
@@ -231,6 +242,10 @@ def plan_weights(
                 WeightPacking.SOURCE_NATIVE,
                 WeightPacking.MMA_PACKED,
                 WeightPacking.IQ2_XS_COMPACT,
+                WeightPacking.IQ3_XXS_COMPACT,
+                WeightPacking.IQ2_XXS_COMPACT,
+                WeightPacking.IQ2_S_COMPACT,
+                WeightPacking.IQ3_S_COMPACT,
             }:
                 raise ValueError(
                     "A16 preparation requires source_native or mma_packed packing"
@@ -239,6 +254,7 @@ def plan_weights(
         raw_plan = plan_b12x_fp4_moe_weights(
             quant_modes=("nvfp4", "w4a16") if automatic else recipe,
             source_format=source.format.value,
+            fc2_format=("mxfp4" if source.fc2_format.value == "fp4_e8m0_k32" else source.fc2_format.value) if source.fc2_format is not None else None,
             activation=activation.nonlinearity,
             params_dtype=activation.io_dtype,
             num_experts=geometry.num_experts,
@@ -303,16 +319,37 @@ def plan_weights(
 def prepare_weights(
     *,
     plan: WeightPlan,
-    weights: PackedWeights | TrellisWeights | IQ2XSWeights,
+    weights: GGUFExpertWeights | PackedWeights | TrellisWeights | IQ2XSWeights | IQ3XXSWeights | IQ2XXSWeights | IQ2SWeights | IQ3SWeights | IQMXFP4Weights | IQMixedWeights,
 ) -> PreparedExperts:
     """Materialize the in-memory representation selected by ``plan_weights``."""
 
     if not isinstance(plan, WeightPlan):
         raise TypeError("plan must be a WeightPlan")
-    if isinstance(plan.source, PackedSource) and plan.source.format.value == "iq2_xs":
-        if not isinstance(weights, IQ2XSWeights):
-            raise TypeError("IQ2_XS preparation requires IQ2XSWeights")
-        prepared = prepare_b12x_iq2_xs_weights(plan=plan._impl, weights=weights)
+    if isinstance(weights, GGUFExpertWeights):
+        from b12x.loader.gguf_experts import prepare_iq_expert_partition
+
+        source = plan.source
+        if not isinstance(source, PackedSource) or source.format.value != weights.gate.quant_type.lower():
+            raise ValueError("GGUF gate format does not match the weight plan")
+        down = None if weights.down.quant_type == weights.gate.quant_type else weights.down.quant_type.lower()
+        if (plan._impl.fc2_format != down or source.w13_layout.value != "w31"
+                or plan.activation.nonlinearity != "silu"
+                or plan.activation.mode is not ActivationMode.A16
+                or plan.activation.io_dtype != torch.bfloat16):
+            raise ValueError("GGUF streaming requires matching formats and BF16 SiLU w31 plan")
+        if (plan.geometry.num_experts, plan.geometry.hidden_size, plan.geometry.intermediate_size) != (
+            len(weights.expert_ids), weights.gate.columns, weights.gate.rows
+        ):
+            raise ValueError("GGUF partition geometry does not match the weight plan")
+        value, _ = prepare_iq_expert_partition(
+            weights.gate, weights.up, weights.down, weights.expert_ids, device=weights.device
+        )
+        return PreparedExperts(plan=plan, _impl=own_b12x_iq_weights(plan=plan._impl, value=value))
+    if isinstance(plan.source, PackedSource) and plan.source.format.value in {"iq2_xs", "iq3_xxs", "iq2_xxs", "iq2_s", "iq3_s"}:
+        expected_type = IQMixedWeights if plan._impl.fc2_format in {"iq3_xxs", "iq3_s"} else IQMXFP4Weights if plan.source.fc2_format is not None else (IQ3SWeights if plan.source.format.value == "iq3_s" else IQ2SWeights if plan.source.format.value == "iq2_s" else IQ2XXSWeights if plan.source.format.value == "iq2_xxs" else IQ3XXSWeights if plan.source.format.value == "iq3_xxs" else IQ2XSWeights)
+        if not isinstance(weights, expected_type):
+            raise TypeError(f"{plan.source.format.value} preparation requires {expected_type.__name__}")
+        prepared = prepare_b12x_iq_weights(plan=plan._impl, weights=weights)
     elif isinstance(plan.source, TrellisConfig):
         if not isinstance(weights, TrellisWeights):
             raise TypeError("Trellis preparation requires TrellisWeights")

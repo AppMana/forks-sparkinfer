@@ -47,12 +47,20 @@ class OperandEncoding(_StringEnum):
     FP4_E2M1 = "fp4_e2m1"
     FP6_E2M3 = "fp6_e2m3"
     IQ2_XS = "iq2_xs"
+    IQ3_XXS = "iq3_xxs"
+    IQ2_XXS = "iq2_xxs"
+    IQ2_S = "iq2_s"
+    IQ3_S = "iq3_s"
     MXFP8_E4M3 = "mxfp8_e4m3"
 
 
 class ScaleEncoding(_StringEnum):
     E4M3_K16 = "e4m3_k16"
     IQ2_XS = "iq2_xs"
+    IQ3_XXS = "iq3_xxs"
+    IQ2_XXS = "iq2_xxs"
+    IQ2_S = "iq2_s"
+    IQ3_S = "iq3_s"
     E4M3_K32 = "e4m3_k32"
     E8M0_K32 = "e8m0_k32"
     E8M0_K32_X_E4M3_K16_RESIDUAL = "e8m0_k32_x_e4m3_k16_residual"
@@ -108,6 +116,10 @@ class PreparedWeightLayout(_StringEnum):
     SOURCE_NATIVE = "source_native"
     TRELLIS_NATIVE = "trellis_native"
     IQ2_XS_COMPACT = "iq2_xs_compact"
+    IQ3_XXS_COMPACT = "iq3_xxs_compact"
+    IQ2_XXS_COMPACT = "iq2_xxs_compact"
+    IQ2_S_COMPACT = "iq2_s_compact"
+    IQ3_S_COMPACT = "iq3_s_compact"
     MMA_VIEW = "mma_view"
     MMA_PACKED = "mma_packed"
     QMMA_REPACKED = "qmma_repacked"
@@ -130,6 +142,10 @@ class WeightPreparationTransform(_StringEnum):
     W4A16_PACKED = "w4a16_packed"
     W4A16_TRELLIS = "w4a16_trellis"
     W4A16_IQ2_XS = "w4a16_iq2_xs"
+    W4A16_IQ3_XXS = "w4a16_iq3_xxs"
+    W4A16_IQ2_XXS = "w4a16_iq2_xxs"
+    W4A16_IQ2_S = "w4a16_iq2_s"
+    W4A16_IQ3_S = "w4a16_iq3_s"
     W4A8_QMMA = "w4a8_qmma"
     W4A8_TRELLIS = "w4a8_trellis"
     W6A8_MXFP6 = "w6a8_mxfp6"
@@ -167,6 +183,10 @@ _SOURCE_FORMATS = {
     "mxfp6_e2m3",
     "b12x_trellis",
     "iq2_xs",
+    "iq3_xxs",
+    "iq2_xxs",
+    "iq2_s",
+    "iq3_s",
     "exl3",
 }
 _TRELLIS_SOURCE_FORMATS = frozenset({"b12x_trellis", "exl3"})
@@ -182,6 +202,10 @@ _SOURCES_BY_QUANT_MODE = {
             "compressed_tensors",
             "b12x_trellis",
             "iq2_xs",
+            "iq3_xxs",
+            "iq2_xxs",
+            "iq2_s",
+            "iq3_s",
             "exl3",
         }
     ),
@@ -285,6 +309,7 @@ class MoEWeightPreparationPlan:
     weight_layouts: frozenset[PreparedWeightLayout]
     scale_layouts: frozenset[PreparedScaleLayout]
     storage_policy: WeightStoragePolicy
+    fc2_format: str | None = None
     trellis_bits: int | None = None
     trellis_tile_config: tuple[int, int, int, int] | None = None
     intermediate_hadamard: bool = False
@@ -299,6 +324,13 @@ class MoEWeightPreparationPlan:
         if not specs:
             raise ValueError("weight preparation requires at least one MoE spec")
         object.__setattr__(self, "specs", specs)
+        if self.fc2_format is not None:
+            if self.fc2_format == "iq3_s" and any(spec.source_format not in {"iq2_s", "iq3_xxs"} for spec in specs):
+                raise ValueError("IQ3_S mixed down requires IQ2_S or IQ3_XXS gate/up")
+            if self.fc2_format == "iq3_xxs" and any(spec.source_format != "iq2_xxs" for spec in specs):
+                raise ValueError("IQ3_XXS mixed down requires IQ2_XXS gate/up")
+            if self.fc2_format not in {"mxfp4", "iq3_xxs", "iq3_s"} or any(spec.source_format not in {"iq2_xs", "iq3_xxs", "iq2_xxs", "iq2_s", "iq3_s"} or spec.quant_mode != "w4a16" for spec in specs):
+                raise ValueError("mixed FC2 format requires a supported native IQ A16 pair")
         object.__setattr__(self, "num_experts", int(self.num_experts))
         object.__setattr__(self, "hidden_size", int(self.hidden_size))
         object.__setattr__(self, "intermediate_size", int(self.intermediate_size))
@@ -527,6 +559,14 @@ class MoEWeightPreparationPlan:
 
     @property
     def w4a16_weight_layout(self) -> str | None:
+        if WeightPreparationTransform.W4A16_IQ3_XXS in self.transforms:
+            return "iq3_xxs"
+        if WeightPreparationTransform.W4A16_IQ2_XXS in self.transforms:
+            return "iq2_xxs"
+        if WeightPreparationTransform.W4A16_IQ2_S in self.transforms:
+            return "iq2_s"
+        if WeightPreparationTransform.W4A16_IQ3_S in self.transforms:
+            return "iq3_s"
         if WeightPreparationTransform.W4A16_IQ2_XS in self.transforms:
             return "iq2_xs"
         if WeightPreparationTransform.W4A16_TRELLIS in self.transforms:
@@ -567,6 +607,14 @@ class MoEWeightPreparationPlan:
                 f"quant_mode={quant_mode!r} is absent from this preparation plan"
             )
         if quant_mode == "w4a16":
+            if WeightPreparationTransform.W4A16_IQ3_XXS in self.transforms:
+                return PreparedWeightLayout.IQ3_XXS_COMPACT
+            if WeightPreparationTransform.W4A16_IQ2_XXS in self.transforms:
+                return PreparedWeightLayout.IQ2_XXS_COMPACT
+            if WeightPreparationTransform.W4A16_IQ2_S in self.transforms:
+                return PreparedWeightLayout.IQ2_S_COMPACT
+            if WeightPreparationTransform.W4A16_IQ3_S in self.transforms:
+                return PreparedWeightLayout.IQ3_S_COMPACT
             if WeightPreparationTransform.W4A16_IQ2_XS in self.transforms:
                 return PreparedWeightLayout.IQ2_XS_COMPACT
             if WeightPreparationTransform.W4A16_TRELLIS in self.transforms:
@@ -700,8 +748,8 @@ def make_moe_spec(
         quant_mode=quant_mode,
     )
 
-    if source_format == "iq2_xs":
-        source_scale = ScaleEncoding.IQ2_XS
+    if source_format in {"iq2_xs", "iq3_xxs", "iq2_xxs", "iq2_s", "iq3_s"}:
+        source_scale = ScaleEncoding(source_format)
     elif source_format in _TRELLIS_SOURCE_FORMATS:
         # Trellis stores codebook indices without a per-weight scale grid. The
         # W4A16 ABI still carries a four-byte dummy E4M3 K/32 scale pointer.
@@ -735,7 +783,7 @@ def make_moe_spec(
         activation_encoding=activation_encoding,
         activation_scale=activation_scale,
         weight_encoding=(
-            OperandEncoding.IQ2_XS if source_format == "iq2_xs" else
+            OperandEncoding(source_format) if source_format in {"iq2_xs", "iq3_xxs", "iq2_xxs", "iq2_s", "iq3_s"} else
             OperandEncoding.FP6_E2M3
             if quant_mode == "w6a8_mx"
             else OperandEncoding.FP4_E2M1
@@ -754,6 +802,7 @@ def plan_moe_weight_preparation(
     hidden_size: int,
     intermediate_size: int,
     w4a16_layout: PreparedWeightLayout | str | None = None,
+    fc2_format: str | None = None,
     trellis_bits: int | None = None,
     trellis_tile_config: tuple[int, int, int, int] | None = None,
     intermediate_hadamard: bool | None = None,
@@ -797,6 +846,10 @@ def plan_moe_weight_preparation(
         PreparedWeightLayout.MMA_PACKED,
         PreparedWeightLayout.TRELLIS_NATIVE,
         PreparedWeightLayout.IQ2_XS_COMPACT,
+        PreparedWeightLayout.IQ3_XXS_COMPACT,
+        PreparedWeightLayout.IQ2_XXS_COMPACT,
+        PreparedWeightLayout.IQ2_S_COMPACT,
+        PreparedWeightLayout.IQ3_S_COMPACT,
     }:
         raise ValueError(
             "W4A16 preparation requires source_native, mma_packed, or "
@@ -812,6 +865,14 @@ def plan_moe_weight_preparation(
 
     if requested_w4a16_layout is PreparedWeightLayout.IQ2_XS_COMPACT and source_format != "iq2_xs":
         raise ValueError("iq2_xs_compact packing requires IQ2_XS weights")
+    if requested_w4a16_layout is PreparedWeightLayout.IQ3_XXS_COMPACT and source_format != "iq3_xxs":
+        raise ValueError("iq3_xxs_compact packing requires IQ3_XXS weights")
+    if requested_w4a16_layout is PreparedWeightLayout.IQ2_XXS_COMPACT and source_format != "iq2_xxs":
+        raise ValueError("iq2_xxs_compact packing requires IQ2_XXS weights")
+    if requested_w4a16_layout is PreparedWeightLayout.IQ2_S_COMPACT and source_format != "iq2_s":
+        raise ValueError("iq2_s_compact packing requires IQ2_S weights")
+    if requested_w4a16_layout is PreparedWeightLayout.IQ3_S_COMPACT and source_format != "iq3_s":
+        raise ValueError("iq3_s_compact packing requires IQ3_S weights")
 
     transforms: set[WeightPreparationTransform] = set()
     weight_layouts: set[PreparedWeightLayout] = set()
@@ -905,15 +966,16 @@ def plan_moe_weight_preparation(
             )
             continue
         if spec.quant_mode == "w4a16":
-            if source_format == "iq2_xs":
+            if source_format in {"iq2_xs", "iq3_xxs", "iq2_xxs", "iq2_s", "iq3_s"}:
+                compact_layout = PreparedWeightLayout(source_format + "_compact")
                 if spec.io_dtype != "bfloat16" or spec.activation not in {"silu", "relu2"}:
-                    raise ValueError("IQ2_XS requires BF16 A16 with SiLU or ReLU²")
+                    raise ValueError(f"{source_format.upper()} requires BF16 A16 with SiLU or ReLU²")
                 if hidden_size % 256 or intermediate_size % 256:
-                    raise ValueError("IQ2_XS requires H/I divisible by 256")
-                if requested_w4a16_layout not in {None, PreparedWeightLayout.IQ2_XS_COMPACT}:
-                    raise ValueError("IQ2_XS requires iq2_xs_compact packing")
-                transforms.add(WeightPreparationTransform.W4A16_IQ2_XS)
-                weight_layouts.add(PreparedWeightLayout.IQ2_XS_COMPACT)
+                    raise ValueError(f"{source_format.upper()} requires H/I divisible by 256")
+                if requested_w4a16_layout not in {None, compact_layout}:
+                    raise ValueError(f"{source_format.upper()} requires {source_format}_compact packing")
+                transforms.add(WeightPreparationTransform("w4a16_" + source_format))
+                weight_layouts.add(compact_layout)
                 scale_layouts.add(PreparedScaleLayout.MMA_PACKED)
                 continue
             if source_format in _TRELLIS_SOURCE_FORMATS:
@@ -986,6 +1048,10 @@ def plan_moe_weight_preparation(
     native_representation = (
         WeightPreparationTransform.W4A16_NATIVE in transforms
         or WeightPreparationTransform.W4A16_IQ2_XS in transforms
+        or WeightPreparationTransform.W4A16_IQ3_XXS in transforms
+        or WeightPreparationTransform.W4A16_IQ2_XXS in transforms
+        or WeightPreparationTransform.W4A16_IQ2_S in transforms
+        or WeightPreparationTransform.W4A16_IQ3_S in transforms
         or WeightPreparationTransform.W4A16_TRELLIS in transforms
         or WeightPreparationTransform.W4A8_TRELLIS in transforms
         # W6A8-MXFP6 keeps the packed FP6 bytes unchanged and transfers
@@ -1015,6 +1081,7 @@ def plan_moe_weight_preparation(
     if intermediate_hadamard is None:
         intermediate_hadamard = False
     return MoEWeightPreparationPlan(
+        fc2_format=fc2_format,
         specs=normalized_specs,
         num_experts=num_experts,
         hidden_size=hidden_size,

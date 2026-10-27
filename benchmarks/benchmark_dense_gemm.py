@@ -747,7 +747,7 @@ def main():
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--evidence", type=pathlib.Path, help="JSONL evidence output for A16 comparisons.")
     parser.add_argument("--model-path", type=pathlib.Path, help="Safetensors checkpoint for checkpoint-a16.")
-    parser.add_argument("--checkpoint-recipe", choices=("iq2_xs", "nvfp4"),
+    parser.add_argument("--checkpoint-recipe", choices=("iq2_xs", "iq3_xxs", "nvfp4"),
                         help="Restrict checkpoint-a16 to one stored weight recipe.")
     parser.add_argument("--profile-graphs", action="store_true",
                         help="Expose one cold-L2 replay per checkpoint case to CUDA profiling.")

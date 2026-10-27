@@ -24,6 +24,10 @@ from b12x.gemm._shared.wo_mxfp8 import (
     pack_mxfp8_scales_for_dense_gemm,
 )
 from ._a16 import NVFP4LinearWeight, pack_nvfp4_weight
+from ._iq3_xxs import IQ3XXSLinearWeight, pack_iq3_xxs_weight
+from ._iq2_xxs import IQ2XXSLinearWeight, pack_iq2_xxs_weight
+from ._q6_k import Q6KLinearWeight, pack_q6_k_weight
+from ._q8_0 import Q8_0LinearWeight, pack_q8_0_weight
 from ._iq2_xs import IQ2XSLinearWeight, pack_iq2_xs_weight
 
 
@@ -50,7 +54,7 @@ class TensorFP8LinearWeight:
     out_features: int
 
 
-Weight: TypeAlias = MXFP8LinearWeight | TensorFP8LinearWeight | NVFP4LinearWeight | IQ2XSLinearWeight
+Weight: TypeAlias = MXFP8LinearWeight | TensorFP8LinearWeight | NVFP4LinearWeight | IQ2XSLinearWeight | IQ3XXSLinearWeight | IQ2XXSLinearWeight | Q8_0LinearWeight | Q6KLinearWeight
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -418,15 +422,28 @@ def pack_weight(
     Pass the weight-only ``global_scale`` and its ``global_scale_kind``
     (``'multiplier'`` or ``'reciprocal'``); no scale transformation occurs.
 
-    ``recipe='iq2_xs'`` takes CUDA uint8 ``[N,K/256,74]`` safetensors block
+    ``recipe='iq2_xxs'`` takes CUDA uint8 ``[N,K/256,66]`` GGUF blocks.
+    ``recipe='iq3_xxs'`` takes CUDA uint8 ``[N,K/256,98]`` GGUF block
+    payloads. ``recipe='iq2_xs'`` takes ``[N,K/256,74]`` block
     payloads with embedded scales. Omit ``scale`` and ``global_scale``.
-    Preparation losslessly rearranges descriptors and metadata for A16 GEMM.
+    ``recipe='q6_k'`` takes CUDA uint8 ``[N,K/256,210]`` blocks.
+    ``recipe='q8_0'`` takes CUDA uint8 ``[N,K/32,34]`` blocks with
+    embedded FP16 scales. Preparation losslessly rearranges descriptors
+    and metadata for A16 GEMM.
     """
 
-    if recipe == "iq2_xs":
+    if recipe == "q6_k":
         if scale is not None or global_scale is not None or global_scale_kind != "multiplier":
-            raise ValueError("IQ2_XS scales are embedded in its block payload")
-        return pack_iq2_xs_weight(weight)
+            raise ValueError("Q6_K scales are embedded in its block payload")
+        return pack_q6_k_weight(weight)
+    if recipe == "q8_0":
+        if scale is not None or global_scale is not None or global_scale_kind != "multiplier":
+            raise ValueError("Q8_0 scales are embedded in its block payload")
+        return pack_q8_0_weight(weight)
+    if recipe in ("iq2_xs", "iq3_xxs", "iq2_xxs"):
+        if scale is not None or global_scale is not None or global_scale_kind != "multiplier":
+            raise ValueError("IQ codebook scales are embedded in its block payload")
+        return (pack_iq2_xxs_weight if recipe == "iq2_xxs" else pack_iq3_xxs_weight if recipe == "iq3_xxs" else pack_iq2_xs_weight)(weight)
     if scale is None:
         raise ValueError("this weight recipe requires a scale tensor")
     if recipe == "nvfp4":
@@ -824,7 +841,7 @@ def blockscaled_mm(
     if plan is None:
         raise TypeError("blockscaled.mm requires a prepared Plan")
 
-    if isinstance(rhs, (NVFP4LinearWeight, IQ2XSLinearWeight)) or (
+    if isinstance(rhs, (NVFP4LinearWeight, IQ2XSLinearWeight, IQ3XXSLinearWeight, IQ2XXSLinearWeight, Q8_0LinearWeight, Q6KLinearWeight)) or (
         isinstance(rhs, MXFP8LinearWeight) and isinstance(lhs, torch.Tensor)
         and lhs.dtype == torch.bfloat16
     ):

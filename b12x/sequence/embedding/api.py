@@ -1,4 +1,4 @@
-"""Exact unquantized embedding lookup without output or replay allocation."""
+"""Exact unquantized or compact Q8_0/Q5_K embedding lookup without output or replay allocation."""
 import torch
 
 from ..._lib.gating import default_is_supported
@@ -7,6 +7,7 @@ from b12x.preparation import Plan
 from b12x.preparation.types import plan_from_handle, require_prepared
 from ._preparation import plan, query_from_call
 from ._tuning import EmbeddingQuery
+from ._q5 import Q5KEmbeddingWeight
 
 
 def _check_weight(weight):
@@ -55,13 +56,47 @@ def _embedding_out_fake(weight: torch.Tensor, ids: torch.Tensor, out: torch.Tens
     return None
 
 
+@torch.library.custom_op("b12x::embedding_q8_out", mutates_args=("out",))
+def _embedding_q8_out(values: torch.Tensor, metadata: torch.Tensor, ids: torch.Tensor,
+                      out: torch.Tensor, plan_handle: int, num_rows: torch.Tensor | None = None) -> None:
+    from b12x.gemm.blockscaled._q8_0 import Q8_0LinearWeight
+    weight = Q8_0LinearWeight(values, metadata, values.shape[1], values.shape[0])
+    require_prepared(plan_from_handle(plan_handle), "sequence.embedding", values.device).run(
+        weight, ids, out=out, num_rows=num_rows)
+
+
+@_embedding_q8_out.register_fake
+def _embedding_q8_out_fake(values: torch.Tensor, metadata: torch.Tensor, ids: torch.Tensor,
+                           out: torch.Tensor, plan_handle: int, num_rows: torch.Tensor | None = None) -> None:
+    return None
+
+
+@torch.library.custom_op("b12x::embedding_q5_out", mutates_args=("out",))
+def _embedding_q5_out(values: torch.Tensor, ids: torch.Tensor, out: torch.Tensor,
+                      plan_handle: int, num_rows: torch.Tensor | None = None) -> None:
+    require_prepared(plan_from_handle(plan_handle), "sequence.embedding", values.device).run(
+        Q5KEmbeddingWeight(values), ids, out=out, num_rows=num_rows)
+
+
+@_embedding_q5_out.register_fake
+def _embedding_q5_out_fake(values: torch.Tensor, ids: torch.Tensor, out: torch.Tensor,
+                           plan_handle: int, num_rows: torch.Tensor | None = None) -> None:
+    return None
+
+
 def run(weight, ids, *, out, plan: Plan, num_rows=None):
-    """Copy exact rows into caller storage through the prepared embedding kernel.
+    """Gather rows (Q8_0 decoded to BF16) into caller storage through the prepared embedding kernel.
 
     IDs and the optional device live count remain dynamic during graph replay.
     Only live rows are written. Invalid live IDs or counts trap on the device.
     """
-    _embedding_out(weight, ids, out, plan.handle, num_rows)
+    from b12x.gemm.blockscaled._q8_0 import Q8_0LinearWeight
+    if isinstance(weight, Q5KEmbeddingWeight):
+        _embedding_q5_out(weight.values, ids, out, plan.handle, num_rows)
+    elif isinstance(weight, Q8_0LinearWeight):
+        _embedding_q8_out(weight.values, weight.metadata, ids, out, plan.handle, num_rows)
+    else:
+        _embedding_out(weight, ids, out, plan.handle, num_rows)
     return out
 
 
@@ -72,3 +107,7 @@ def is_supported(device=None):
 def clear_caches():
     from ._kernel import compile_embedding
     compile_embedding.cache_clear()
+    from ._q8 import compile_q8_embedding
+    compile_q8_embedding.cache_clear()
+    from ._q5 import compile_q5_embedding
+    compile_q5_embedding.cache_clear()

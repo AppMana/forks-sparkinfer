@@ -182,6 +182,7 @@ class PreparedW4A16MoeWeights:
     w13_layout: str = "packed"
     weight_layout: str = "trellis_t256"
     scale_format: str = "e4m3_k32"
+    fc2_format: str | None = None
     trellis: TrellisWeightState | None = None
 
     @property

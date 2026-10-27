@@ -1,5 +1,5 @@
 """Immutable shape and layout contract for exact embedding lookup."""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from b12x.preparation import make_fixed_contract
 
@@ -13,8 +13,13 @@ class EmbeddingQuery:
     weight_dtype: str
     id_dtype: str
     device_count: bool = False
+    recipe: str = "plain"
 
     def __post_init__(self):
+        if self.recipe not in ("plain", "q8_0", "q5_k"):
+            raise ValueError("Unsupported embedding recipe")
+        if self.recipe in ("q8_0", "q5_k") and (self.weight_dtype != "bfloat16" or self.width % 256 or self.row_stride != self.width):
+            raise ValueError("Quantized embedding requires BF16 output and compact K256 rows")
         if any(type(value) is not int or value < 0 for value in (self.max_rows, self.table_rows)):
             raise ValueError("embedding row bounds must be nonnegative integers")
         if type(self.width) is not int or self.width <= 0 or type(self.row_stride) is not int or self.row_stride < self.width:
@@ -27,6 +32,6 @@ class EmbeddingQuery:
             raise ValueError("device-count embedding requires a positive row capacity")
 
 
-TUNING = make_fixed_contract(
+TUNING = replace(make_fixed_contract(
     component_id="sequence.embedding", query_type=EmbeddingQuery, backend="cute",
-)
+), query_schema_version=3)

@@ -151,6 +151,7 @@ def qualify_capacity(
     patterns=("balanced", "hot", "imbalanced"),
     repeats=20,
     launches=50,
+    reference_fn=None,
 ):
     """Exercise several live counts with compilation and kernel resolution frozen."""
     from b12x._lib import compiler
@@ -158,6 +159,7 @@ def qualify_capacity(
     from b12x.moe._shared.kernels.w4a16 import kernel
     from b12x.moe.fused_moe import _preparation
 
+    oracle = reference if reference_fn is None else reference_fn
     mapped = layer.expert_ids != tuple(range(layer.route_num_experts))
     declaration = moe.plan_execution(
         experts=experts,
@@ -232,7 +234,7 @@ def qualify_capacity(
             )
             for pattern in patterns:
                 set_routes(inputs, pattern, experts=layer.route_num_experts)
-                expected = reference(layer, inputs, activation=activation)
+                expected = oracle(layer, inputs, activation=activation)
                 inputs.output.fill_(float("nan"))
                 moe.run(binding=binding)
                 metrics = check(inputs.output, expected)
@@ -245,7 +247,7 @@ def qualify_capacity(
                         inputs, pattern, experts=layer.route_num_experts, offset=13
                     )
                     inputs.probabilities.mul_(0.75)
-                    expected = reference(layer, inputs, activation=activation)
+                    expected = oracle(layer, inputs, activation=activation)
                     inputs.output.fill_(float("nan"))
                     for buffer in scratch:
                         if buffer.dtype in (

@@ -134,6 +134,7 @@ def _query(
         ),
         quant_modes=tuple(sorted(plan.quant_modes)),
         source_format=plan.source_format,
+        fc2_format=plan.fc2_format,
         activation=plan.activation,
         io_dtype=plan.io_dtype,
         num_experts=experts.num_experts,
@@ -350,7 +351,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
     tokens = int(scratch.launch_plan.max_tokens_per_launch)
     weight_layout = caps.w4a16_weight_layout or "packed"
     scale_format = caps.w4a16_scale_format or "e4m3_k16"
-    if weight_layout not in {"packed", "modelopt", "iq2_xs"}:
+    if weight_layout not in {"packed", "modelopt", "iq2_xs", "iq3_xxs", "iq2_xxs", "iq2_s", "iq3_s"}:
         raise ValueError(f"unsupported standard W4A16 weight layout {weight_layout!r}")
     element_dtype = "bf16" if core.dtype == torch.bfloat16 else "fp16"
     w13_layout = caps.w13_layout if weight_layout == "modelopt" else "packed"
@@ -365,6 +366,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
     with torch.cuda.device(core.device):
         props = torch.cuda.get_device_properties(core.device)
         compiler_args = dict(
+            fc2_format=caps.weight_plan.fc2_format,
             size_m=tokens, hidden_size=core.k, intermediate_size=core.n,
             num_experts=core.weight_E, top_k=core.num_topk,
             activation=core.activation,
@@ -386,7 +388,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
             **compiler_args, zero_fc2_output=True, max_m_blocks=packed_blocks,
         )
         direct = direct_mapped = None
-        if weight_layout == "iq2_xs":
+        if weight_layout in {"iq2_xs", "iq3_xxs", "iq2_xxs", "iq2_s", "iq3_s"}:
             if (tokens <= 8 and core.activation in {"silu", "relu2"} and not caps.deterministic_output
                     and not caps.collect_activation_amax and not caps.apply_router_weight_on_input):
                 decode_args = {**compiler_args, "moe_block_size": 8}
@@ -1072,8 +1074,8 @@ def plan_fc2(experts: PreparedExperts, invocation: FC2Invocation, *, override=No
              declaration_invocation: FrozenMapping = FrozenMapping()) -> Plan:
     if not isinstance(experts, PreparedExperts):
         raise TypeError("FC2 preparation requires canonical PreparedExperts")
-    if experts.plan._impl.source_format == "iq2_xs":
-        raise NotImplementedError("standalone IQ2_XS FC2 is unsupported; use fused MoE")
+    if experts.plan._impl.source_format in {"iq2_xs", "iq3_xxs", "iq2_xxs", "iq2_s", "iq3_s"}:
+        raise NotImplementedError(f"standalone {experts.plan._impl.source_format.upper()} FC2 is unsupported; use fused MoE")
     if not isinstance(invocation, FC2Invocation):
         raise TypeError("FC2 preparation requires FC2Invocation")
     from ._tuning import MoeFC2Query

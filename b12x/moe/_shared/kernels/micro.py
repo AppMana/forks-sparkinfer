@@ -1991,7 +1991,9 @@ class MoEMicroKernelBackend:
 
         lane_byte_off = Int64(lane) * Int64(4)
         n_u32_per_expert = Int32(cfg.fc2_n_chunks * 128)
-        token_inter_base = t * Int32(cfg.inter_u32)
+        token_inter_base = Int64(t) * Int64(cfg.inter_u32)
+        if cutlass.const_expr(self.compile_time_phase == 2):
+            token_inter_base = Int64(t) * Int64(cfg.n // 2)
         sf_cols = Int32(cfg.w2_sf_cols)
         num_cb = sf_cols >> Int32(2)
         lane_cb = lane >> Int32(3)
@@ -2172,7 +2174,17 @@ class MoEMicroKernelBackend:
                 kk_off = token_inter_base + Int32(kk) * n_u32_per_expert + chunk_base
                 # See _m1_fc2_rowpair_wide: logical n, not the padded scale
                 # grid, determines whether the native intermediate tail is live.
-                if cutlass.const_expr(cfg.n % 256 != 0):
+                if cutlass.const_expr(self.compile_time_phase == 2):
+                    # Standalone FC2 receives contiguous BF16 rows. Fused FC1
+                    # emits four 32-word bands per chunk instead. The narrow
+                    # consumer already distinguishes these layouts; do the
+                    # same for multi-chunk intermediates such as DSV4.1 I=2304.
+                    inter_off = token_inter_base + Int64(nc * 128) + Int64(lane) * Int64(4)
+                    xh0 = Uint32(intermediate[inter_off]) if w_valid > Int32(0) else Uint32(0)
+                    xh1 = Uint32(intermediate[inter_off + Int64(1)]) if w_valid > Int32(0) else Uint32(0)
+                    xh2 = Uint32(intermediate[inter_off + Int64(2)]) if w_valid > Int32(0) else Uint32(0)
+                    xh3 = Uint32(intermediate[inter_off + Int64(3)]) if w_valid > Int32(0) else Uint32(0)
+                elif cutlass.const_expr(cfg.n % 256 != 0):
                     xh0 = (
                         Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
                         if w_valid > Int32(0)

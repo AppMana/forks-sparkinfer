@@ -183,8 +183,12 @@ def w8a16(
 
 def _weight_parts(weight):
     from ._linear import MXFP8LinearWeight
+    from ._iq3_xxs import IQ3XXSLinearWeight
+    from ._q6_k import Q6KLinearWeight
+    from ._q8_0 import Q8_0LinearWeight
+    from ._iq2_xxs import IQ2XXSLinearWeight
     from ._iq2_xs import IQ2XSLinearWeight
-    if isinstance(weight, IQ2XSLinearWeight):
+    if isinstance(weight, (IQ2XSLinearWeight, IQ3XXSLinearWeight, IQ2XXSLinearWeight, Q8_0LinearWeight, Q6KLinearWeight)):
         return weight.values, weight.metadata, None, False
     if isinstance(weight, NVFP4LinearWeight):
         return weight.values, weight.scale_mma, weight.global_scale, True

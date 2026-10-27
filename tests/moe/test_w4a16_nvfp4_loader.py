@@ -54,12 +54,12 @@ class _DecodeScaleBytes:
 
 
 class _DecodeNativeValues:
-    def __init__(self, element_dtype):
+    def __init__(self, element_dtype, scale_format="e4m3_k16"):
         self.consumer = W4A16GemmKernel(
             size_m=1, size_n=128, size_k=128, num_experts=1, top_k=1,
             mul_topk_weights=False, tile_n=128, tile_k=128,
             moe_block_size=8, max_m_blocks=1, element_dtype=element_dtype,
-            weight_layout="modelopt", scale_format="e4m3_k16",
+            weight_layout="modelopt", scale_format=scale_format,
         )
 
     @cute.jit
@@ -137,3 +137,19 @@ def test_modelopt_register_pack_preserves_every_fp4_code() -> None:
     launch = cute.compile(_PackWords(), *args)
     launch(*args)
     torch.testing.assert_close(result.cpu().to(torch.int64), expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_native_mxfp4_decode_preserves_small_scales_without_compensation():
+    words_cpu = (torch.arange(256, dtype=torch.int64) * 0x01010101).repeat_interleave(248)
+    scale_codes = torch.arange(248, dtype=torch.uint8).repeat(256)
+    codes = (words_cpu[:, None] >> (torch.arange(8) * 4)) & 15
+    codebook = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6])
+    expected = (codebook[codes[:, [0, 4, 1, 5, 2, 6, 3, 7]]].double() * torch.exp2(scale_codes.double()[:, None] - 127)).to(torch.bfloat16)
+    words = words_cpu.to(device="cuda", dtype=torch.uint32)
+    scales = (scale_codes.to(torch.int64) * 0x01010101).to(device="cuda", dtype=torch.uint32)
+    result = torch.empty((words.numel(), 4), dtype=torch.uint32, device="cuda")
+    args = (from_dlpack(words), from_dlpack(scales), from_dlpack(result), cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+    launch = cute.compile(_DecodeNativeValues("bf16", "e8m0_k32"), *args)
+    launch(*args)
+    torch.testing.assert_close(result.view(torch.bfloat16).cpu(), expected, rtol=0, atol=0)

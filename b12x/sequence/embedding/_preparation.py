@@ -10,6 +10,22 @@ from ._tuning import EmbeddingQuery, TUNING
 
 
 def query_from_call(weight, ids, *, out, num_rows=None):
+    from ._q5 import Q5KEmbeddingWeight
+    if isinstance(weight, Q5KEmbeddingWeight):
+        from ._q5 import check
+        check(weight, ids, out, num_rows)
+        return EmbeddingQuery(max_rows=ids.numel(), table_rows=weight.out_features,
+                              width=weight.in_features, row_stride=weight.in_features,
+                              weight_dtype="bfloat16", id_dtype=str(ids.dtype).removeprefix("torch."),
+                              device_count=num_rows is not None, recipe="q5_k")
+    from b12x.gemm.blockscaled._q8_0 import Q8_0LinearWeight
+    if isinstance(weight, Q8_0LinearWeight):
+        from ._q8 import check
+        check(weight, ids, out, num_rows)
+        return EmbeddingQuery(max_rows=ids.numel(), table_rows=weight.out_features,
+                              width=weight.in_features, row_stride=weight.in_features,
+                              weight_dtype="bfloat16", id_dtype=str(ids.dtype).removeprefix("torch."),
+                              device_count=num_rows is not None, recipe="q8_0")
     from .api import _check_tensors
     _check_tensors(weight, ids, out, num_rows)
     return EmbeddingQuery(
@@ -22,9 +38,16 @@ def query_from_call(weight, ids, *, out, num_rows=None):
 def compile_lookup(payload, ordinal):
     from ._kernel import compile_embedding
     query = EmbeddingQuery(**dict(payload))
-    compiled = compile_embedding(
-        query.width, getattr(torch, query.weight_dtype), getattr(torch, query.id_dtype), ordinal,
-    )
+    if query.recipe == "q5_k":
+        from ._q5 import compile_q5_embedding
+        compiled = compile_q5_embedding(query.width, getattr(torch, query.id_dtype), ordinal)
+    elif query.recipe == "q8_0":
+        from ._q8 import compile_q8_embedding
+        compiled = compile_q8_embedding(query.width, getattr(torch, query.id_dtype), ordinal)
+    else:
+        compiled = compile_embedding(
+            query.width, getattr(torch, query.weight_dtype), getattr(torch, query.id_dtype), ordinal,
+        )
     return attach_programs(_EmbeddingState(query, torch.device("cuda", ordinal), compiled.raw, compiled.types), compiled.raw)
 
 
@@ -36,6 +59,20 @@ class _EmbeddingState:
     types: tuple
 
     def run(self, weight, ids, *, out, num_rows=None):
+        if self.query.recipe in ("q8_0", "q5_k"):
+            if self.query.recipe == "q5_k":
+                from ._q5 import check, launch
+            else:
+                from ._q8 import check, launch
+            check(weight, ids, out, num_rows)
+            q = self.query
+            if (weight.values.device != self.device or weight.out_features > q.table_rows
+                    or weight.in_features != q.width or ids.numel() > q.max_rows
+                    or ids.dtype != getattr(torch, q.id_dtype)
+                    or (num_rows is not None) != q.device_count):
+                raise ValueError("Quantized embedding differs from prepared geometry or dtype")
+            launch(weight, ids, out, num_rows, prepared=(self.program, self.types))
+            return out
         from .api import _check_tensors
         from ._kernel import launch
         _check_tensors(weight, ids, out, num_rows)

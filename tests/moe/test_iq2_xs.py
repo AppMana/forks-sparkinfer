@@ -242,12 +242,14 @@ def test_invalid_payload_rejected(source):
         ({"apply_router_weight_on_input": True}, False),
     ],
 )
-def test_direct_route_eligibility(overrides, expected):
+@pytest.mark.parametrize("recipe", ["iq2_xs", "iq3_xxs"])
+def test_direct_route_eligibility(overrides, expected, recipe):
     from b12x.moe.fused_moe._impl import _w4a16_direct_routing_supported
 
     query = SimpleNamespace(
         **{
-            "source_format": "iq2_xs",
+            "source_format": recipe,
+            "w4a16_weight_layout": recipe,
             "quant_mode": "w4a16",
             "hidden_size": 2048,
             "intermediate_size": 512,
@@ -264,20 +266,21 @@ def test_direct_route_eligibility(overrides, expected):
 
 
 @pytest.mark.parametrize("capacity", [1, 2, 4, 6, 7, 8, 9])
-def test_relu2_tuning_races_supported_route_modes(capacity):
+@pytest.mark.parametrize("recipe", ["iq2_xs", "iq3_xxs"])
+def test_relu2_tuning_races_supported_route_modes(capacity, recipe):
     from b12x.moe.fused_moe._tuning import MoeDecodeQuery, TUNING
     from b12x.preparation import DeviceIdentity, FrozenMapping
 
     query = MoeDecodeQuery(
-        quant_mode="w4a16", quant_modes=("w4a16",), source_format="iq2_xs",
+        quant_mode="w4a16", quant_modes=("w4a16",), source_format=recipe,
         activation="relu2", io_dtype="bfloat16", num_experts=512,
         hidden_size=1024, intermediate_size=1280, top_k=4,
         num_tokens=capacity, routed_rows=capacity * 4, route_num_experts=512,
         route_logits_dtype=None, apply_router_weight_on_input=False,
         collect_activation_amax=False, deterministic_output=False,
         swiglu_limit=None, swiglu_alpha=1.0, swiglu_beta=0.0,
-        w13_layout="w31", weight_layouts=("iq2_xs",),
-        w4a16_weight_layout="iq2_xs", w4a16_scale_format="iq2_xs",
+        w13_layout="w31", weight_layouts=(recipe,),
+        w4a16_weight_layout=recipe, w4a16_scale_format=recipe,
         w4a16_block_size_m=None, fast_math=True, numerical_recipe=None,
         controls=FrozenMapping(),
     )

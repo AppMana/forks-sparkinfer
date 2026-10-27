@@ -46,6 +46,7 @@ class MoeDecodeQuery:
     numerical_recipe: str | None
     controls: FrozenMapping
     shared_input_scales: bool = False
+    fc2_format: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -66,6 +67,7 @@ class MoeDecodeQuery:
             "route_num_experts": self.route_num_experts,
             "routed_rows": self.routed_rows,
             "source_format": self.source_format,
+            "fc2_format": self.fc2_format,
             "swiglu_alpha": self.swiglu_alpha,
             "swiglu_beta": self.swiglu_beta,
             "swiglu_limit": self.swiglu_limit,
@@ -170,6 +172,15 @@ def _validate_query(query: MoeDecodeQuery, _device: DeviceIdentity | None) -> No
         raise TypeError("MoE numerical_recipe must be a string or null")
     if type(query.shared_input_scales) is not bool:
         raise TypeError("shared_input_scales must be boolean")
+    if query.fc2_format is not None:
+        if query.fc2_format == "iq3_s" and query.source_format not in {"iq2_s", "iq3_xxs"}:
+            raise ValueError("IQ3_S mixed down requires IQ2_S or IQ3_XXS gate/up")
+        if query.fc2_format == "iq3_xxs" and query.source_format != "iq2_xxs":
+            raise ValueError("IQ3_XXS mixed down requires IQ2_XXS gate/up")
+        if query.fc2_format not in {"mxfp4", "iq3_xxs", "iq3_s"} or query.source_format not in {"iq2_xs", "iq3_xxs", "iq2_xxs", "iq2_s", "iq3_s"} or query.quant_mode != "w4a16":
+            raise ValueError("mixed FC2 requires a supported native IQ A16 pair")
+        if query.collect_activation_amax:
+            raise NotImplementedError("mixed IQ calibration is not prepared")
     if not query.weight_layouts:
         raise ValueError("MoE query requires declared weight layouts")
 
@@ -225,16 +236,16 @@ def validate_moe_decode_config(
     config: MoeDecodeConfig,
     _device: DeviceIdentity | None,
 ) -> None:
-    if query.source_format == "iq2_xs":
+    if query.source_format in {"iq2_xs", "iq3_xxs", "iq2_xxs", "iq2_s", "iq3_s"}:
         if query.quant_mode != "w4a16" or query.io_dtype != "bfloat16":
-            raise ValueError("IQ2_XS requires BF16 W4A16 execution")
+            raise ValueError(f"{query.source_format.upper()} requires BF16 W4A16 execution")
         if query.activation not in {"silu", "relu2"} or query.hidden_size % 256 or query.intermediate_size % 256:
-            raise ValueError("IQ2_XS requires aligned SiLU or ReLU² geometry")
+            raise ValueError(f"{query.source_format.upper()} requires aligned SiLU or ReLU² geometry")
         if config.w4a16_route_mode == "direct":
             from ._impl import _w4a16_direct_routing_supported
             if not _w4a16_direct_routing_supported(query):
                 raise ValueError(
-                    "IQ2_XS direct routing requires nondeterministic SiLU or ReLU² capacity <= 8, "
+                    f"{query.source_format.upper()} direct routing requires nondeterministic SiLU or ReLU² capacity <= 8, "
                     "without activation amax or input router weights"
                 )
     if query.quant_mode == "multi":
@@ -549,7 +560,7 @@ FC2_TUNING = replace(FC2_TUNING, validate_query=_validate_fc2_query)
 
 TUNING = TuningContract(
     component_id="moe.decode",
-    query_schema_version=9,
+    query_schema_version=15,
     config_schema_version=7,
     query_fields=frozenset(MoeDecodeQuery.__dataclass_fields__),
     config_fields=frozenset(MoeDecodeConfig.__dataclass_fields__),
@@ -559,7 +570,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=14,
+    candidate_contract_version=18,
     knobs=(
         # Enumeration order prefers A16 at equal measured latency on every rank.
         Knob(name="backend", values=("w4a16", "micro", "dynamic"), binding=ParameterBinding.COMPILE),
