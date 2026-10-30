@@ -31,9 +31,16 @@ _OP_MODULES = (
 )
 
 
+_OP_ALIASES = {
+    "compressed_mla": "compressed_sparse_mla",
+    "nsa_indexer": "dsa_indexer",
+}
+
+
 def __getattr__(name: str) -> Any:
-    if name in _OP_MODULES:
-        module = importlib.import_module(f".{name}", __name__)
+    target = _OP_ALIASES.get(name, name)
+    if target in _OP_MODULES:
+        module = importlib.import_module(f".{target}", __name__)
         globals()[name] = module
         return module
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

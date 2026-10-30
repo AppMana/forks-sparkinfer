@@ -71,6 +71,10 @@ def compressed_sparse_mla_scale_region_offset(page_size: int) -> int:
     return page_size * COMPRESSED_SPARSE_MLA_NOPE_ROPE_BYTES_PER_TOKEN
 
 
+compressed_mla_page_nbytes = compressed_sparse_mla_page_nbytes
+compressed_mla_scale_region_offset = compressed_sparse_mla_scale_region_offset
+
+
 def ue8m0_to_float(scale_ue8m0: torch.Tensor) -> torch.Tensor:
     """Decode UE8M0 scale bytes using the standard exponent bias."""
 

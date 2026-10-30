@@ -14,11 +14,16 @@ from pathlib import Path
 import torch
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
-from vllm.model_executor.model_loader.weight_utils import (
-    enable_tqdm,
-    file_source_tensor,
-    safetensors_file_sources,
-)
+try:
+    from vllm.model_executor.model_loader.weight_utils import (
+        enable_tqdm,
+        file_source_tensor,
+        safetensors_file_sources,
+    )
+    _HAS_VLLM_FILE_SOURCES = True
+except ImportError:
+    enable_tqdm = file_source_tensor = safetensors_file_sources = None
+    _HAS_VLLM_FILE_SOURCES = False
 
 from b12x.loader._checkpoint import DirectWeightSession
 from b12x.loader._progress import CheckpointDisplay
@@ -260,6 +265,11 @@ class B12xModelLoader(DefaultModelLoader):
 
 
 def register_b12x_loader():
-    from vllm.model_executor.model_loader import register_model_loader
+    if not _HAS_VLLM_FILE_SOURCES:
+        return
+    try:
+        from vllm.model_executor.model_loader import register_model_loader
+    except ImportError:
+        return
 
     register_model_loader("b12x")(B12xModelLoader)

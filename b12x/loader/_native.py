@@ -21,6 +21,10 @@ _LOCK = threading.Lock()
 
 
 def _build() -> Path:
+    ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
+    precompiled = Path(__file__).with_name("_b12x_loader_storage" + ext_suffix)
+    if precompiled.is_file():
+        return precompiled
     import torch
 
     source = Path(__file__).with_name("_storage.c")

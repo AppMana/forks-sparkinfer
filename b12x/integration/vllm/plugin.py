@@ -104,37 +104,40 @@ def register_b12x_fp6() -> None:
         pass
 
     try:
-        from vllm.model_executor.layers.fused_moe.layer import FusedMoEMethodBase
-    except ImportError:
         try:
-            from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase
+            from vllm.model_executor.layers.fused_moe.layer import FusedMoEMethodBase
         except ImportError:
-            from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
-                FusedMoEMethodBase,
-            )
-    from vllm.model_executor.layers.linear import (
-        LinearMethodBase,
-        UnquantizedLinearMethod,
-    )
-    from vllm.model_executor.layers.quantization import register_quantization_config
-    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-    from vllm.model_executor.parameter import (
-        ModelWeightParameter,
-        PerTensorScaleParameter,
-    )
-    from vllm.utils.b12x import (
-    set_b12x_preparation_provider,
-        B12xPreparationUnit,
-        b12x_layer,
-        b12x_layer_prefix,
-        register_b12x_layer,
-    )
-    from vllm.utils.torch_utils import (
-        LayerNameType,
-        _encode_layer_name,
-        _resolve_layer_name,
-        direct_register_custom_op,
-    )
+            try:
+                from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase
+            except ImportError:
+                from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+                    FusedMoEMethodBase,
+                )
+        from vllm.model_executor.layers.linear import (
+            LinearMethodBase,
+            UnquantizedLinearMethod,
+        )
+        from vllm.model_executor.layers.quantization import register_quantization_config
+        from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+        from vllm.model_executor.parameter import (
+            ModelWeightParameter,
+            PerTensorScaleParameter,
+        )
+        from vllm.utils.b12x import (
+            set_b12x_preparation_provider,
+            B12xPreparationUnit,
+            b12x_layer,
+            b12x_layer_prefix,
+            register_b12x_layer,
+        )
+        from vllm.utils.torch_utils import (
+            LayerNameType,
+            _encode_layer_name,
+            _resolve_layer_name,
+            direct_register_custom_op,
+        )
+    except ImportError:
+        return
 
     # ``LayerNameType`` is only a local import here (this module stays vLLM-free
     # at plain import time), but ``infer_schema`` resolves string annotations
